@@ -3,6 +3,6 @@
   "author": "tettou771",
   "license": "MIT",
   "category": "ai",
-  "keywords": ["typesafe", "jev", "system-one", "classification", "scoring", "llm", "api"],
+  "keywords": ["typesafe", "jev", "system-one", "classification", "scoring", "api"],
   "dependencies": ["tcxCurl"]
 }
