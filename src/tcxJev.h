@@ -19,11 +19,11 @@
 //       .state("Help! My payouts have been failing for 3 days.")
 //       .noul("urgent", "Does this convey urgency?"));
 //
-// Threading: requests run one at a time on a worker thread (setAsync(false):
-// on the calling thread), and responseEvent fires on that thread. As with any
-// tc::Event, each listener picks where it runs: tc::Deliver::Main for the main
-// thread (anything touching nodes / GPU), plain listen() for right away on the
-// worker. See README.md.
+// Threading: requests run on worker threads, up to setMaxConcurrent() at once
+// (setAsync(false): on the calling thread), and responseEvent fires on the
+// thread that ran the request. As with any tc::Event, each listener picks
+// where it runs: tc::Deliver::Main for the main thread (anything touching
+// nodes / GPU), plain listen() for right away on the worker. See README.md.
 // =============================================================================
 
 #include <TrussC.h>
@@ -56,6 +56,7 @@ struct Answer {
 struct ResponseEventArgs {
     uint64_t requestId = 0;    // the id request() returned
     bool ok = false;           // true: answers are valid
+    bool cancelled = false;    // cancel() / cancelAll() dropped it before it was sent
     int statusCode = 0;        // HTTP status of the last attempt, 0 = no HTTP response
     std::string error;         // why it failed (empty when ok)
     std::string model;         // versioned model that answered, e.g. "jev-1.13.0"
@@ -156,10 +157,11 @@ public:
     // API key from the TYPESAFE_API_KEY environment variable, if set.
     Client();
     explicit Client(std::string apiKey);
-    // Stops the worker: queued requests are dropped and nothing fires after
+    // Stops the workers: queued requests are dropped and nothing fires after
     // this returns (Deliver::Main calls still waiting for the main thread die
-    // with responseEvent). Waits for an HTTP call already in progress (bounded
-    // by setTimeout()) and for a listener running on another thread.
+    // with responseEvent). Waits for HTTP calls already in progress (they end
+    // together, so at most one setTimeout()) and for a listener running on
+    // another thread.
     ~Client();
 
     Client(const Client&) = delete;
@@ -174,13 +176,24 @@ public:
     Client& setTimeout(float seconds);       // per HTTP attempt, default 30
     float getTimeout() const;
 
-    // Retries after the first attempt, default 3. Retried: 408, 429, 5xx
-    // (including 529 Overloaded) and network errors, with exponential backoff.
+    // Retries after the first attempt, default 3. Retried: 408, 5xx and
+    // network errors, with exponential backoff. 429 (rate limited) and 529
+    // (overloaded) are retried separately, up to 10 times, and pause the
+    // whole client (see README.md). 0 disables every retry, 429/529 included.
     Client& setMaxRetries(int retries);
     int getMaxRetries() const;
     // Backoff before retry n (0-based): min(initial * 2^n, max), minus up to
-    // 25% random jitter. Default 0.5 s / 8 s.
+    // 25% random jitter. Default 0.5 s / 8 s. A rate-limit pause starts from
+    // the same initial delay and doubles up to 30 s (or max, if larger).
     Client& setRetryDelay(float initialSeconds, float maxSeconds = 8.0f);
+
+    // How many requests may be in flight at once (async), default 10. Each
+    // runs on its own worker thread; threads start as requests queue up. With
+    // more than 1, responses fire in the order they complete (match them by
+    // requestId); 1 keeps request order. Lowering it takes effect as running
+    // requests finish.
+    Client& setMaxConcurrent(int n);
+    int getMaxConcurrent() const;
 
     // Queue a request. Returns its id (> 0, increasing), which the matching
     // ResponseEventArgs carries. Returns 0 when it could not be queued (no
@@ -189,27 +202,44 @@ public:
     // Raw form: `questions` is the API's name -> question object map.
     uint64_t request(const tc::Json& state, const tc::Json& questions);
 
-    // Fired once per accepted request, in request order, on the thread that
-    // ran the HTTP call: the worker (async) or the caller of request() (sync).
+    // Accepted requests whose responseEvent has not fired yet (queued, being
+    // sent, or waiting to fire).
+    size_t getPendingCount() const;
+
+    // Drop a request that is still queued (not sent yet). Its responseEvent
+    // fires right away, on this thread, with `cancelled` set, so every
+    // accepted id still gets exactly one event. Returns false when the id is
+    // unknown, already sent, or already answered.
+    bool cancel(uint64_t id);
+    // Drop every queued request (each fires as cancelled, in id order).
+    // Requests already being sent are not affected. Returns how many.
+    size_t cancelAll();
+
+    // Fired once per accepted request (answered, failed or cancelled), on the
+    // thread that ran the HTTP call: a worker (async) or the caller of
+    // request() (sync); for cancel() / cancelAll(), the caller's thread.
+    // Listeners are never called concurrently. With setMaxConcurrent(1) the
+    // events come in request order, otherwise in completion order.
     // Listen with tc::Deliver::Main to run a listener on the main thread
     // instead (at the start of the next frame, before update(); needs the
     // TrussC frame loop).
     tc::Event<ResponseEventArgs> responseEvent;
 
-    // true (default where threads exist): requests run on one worker thread,
-    // FIFO, one at a time. false: request() runs the HTTP call (and its
-    // retries) on the calling thread and fires responseEvent before returning.
-    // Where threads are unavailable (web) setAsync(true) logs an error and
-    // async stays false.
+    // true (default where threads exist): requests run on worker threads, up
+    // to setMaxConcurrent() at a time. false: request() runs the HTTP call
+    // (and its retries) on the calling thread and fires responseEvent before
+    // returning. Where threads are unavailable (web) setAsync(true) logs an
+    // error and async stays false.
     Client& setAsync(bool async);
     bool isAsync() const;
     static bool isAsyncSupported();
 
     // Replace the HTTP call, for tests or custom networking (a proxy, another
-    // HTTP stack). It runs on the worker thread (async) or the calling thread
-    // (sync), one call at a time per client. An empty function restores the
-    // default tcxCurl transport. With a custom transport, request() does not
-    // require an API key.
+    // HTTP stack). It runs on a worker thread (async) or the calling thread
+    // (sync), up to getMaxConcurrent() calls at a time per client, so it must
+    // be thread-safe unless setMaxConcurrent(1). An empty function restores
+    // the default tcxCurl transport. With a custom transport, request() does
+    // not require an API key.
     Client& setTransport(Transport transport);
 
 private:

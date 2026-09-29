@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <deque>
 #include <random>
+#include <vector>
 
 #include <thread>
 
@@ -29,6 +30,9 @@ constexpr const char* kDefaultModel = "jev-latest";
 constexpr size_t kMaxChoiceOptions = 255;
 constexpr size_t kMinScoreLevels = 2;
 constexpr size_t kMaxScoreLevels = 10;
+constexpr int kDefaultMaxConcurrent = 10;
+constexpr int kRateLimitRetries = 10;       // 429 / 529 retries per request, apart from maxRetries
+constexpr float kRateLimitMaxPause = 30.0f; // seconds; a client-wide pause never grows past this
 
 #if defined(__EMSCRIPTEN__)
 // Web: no worker threads (and tcxCurl has no web backend), so request() is
@@ -95,6 +99,13 @@ const char* statusText(int code) {
 // no response at all (connection failure, timeout). Other 4xx are final.
 bool isRetryable(int status) {
     return status == 0 || status == 408 || status == 429 || (status >= 500 && status <= 599);
+}
+
+// 429 Too Many Requests and 529 Overloaded say "everyone, slow down" rather
+// than "this request failed": they pause the whole client instead of backing
+// off one request, and get their own retry budget.
+bool isRateLimited(int status) {
+    return status == 429 || status == 529;
 }
 
 float backoffSeconds(int attempt, float initial, float maxDelay) {
@@ -399,16 +410,18 @@ Json Request::toJson(const string& defaultModel) const {
 }
 
 // =============================================================================
-// Client::State - everything the worker touches. Shared-owned, so a worker
+// Client::State - everything the workers touch. Shared-owned, so a worker
 // that outlives its Client (destroyed from one of its own listeners) still has
 // valid memory; `owner` says whether there is anything left to fire.
 // =============================================================================
 
 struct Client::State : std::enable_shared_from_this<Client::State> {
+    using Clock = chrono::steady_clock;
+
     Mutex mutex;                  // guards everything below
 #if !defined(__EMSCRIPTEN__)
-    std::condition_variable cv;   // new job, stop, fire slot released
-    std::thread worker;
+    std::condition_variable cv;   // new job, stop, slot freed, fire slot released
+    vector<std::thread> workers;  // started on demand, never more than maxConcurrent
 #endif
     Client* owner = nullptr;      // cleared by ~Client while no other thread fires
 
@@ -419,39 +432,108 @@ struct Client::State : std::enable_shared_from_this<Client::State> {
     int maxRetries = 3;
     float retryInitial = 0.5f;
     float retryMax = 8.0f;
+    int maxConcurrent = kDefaultMaxConcurrent;
     bool async = kThreadsAvailable;
     Transport transport;
 
     uint64_t nextId = 1;
     bool stop = false;
-    deque<Job> jobs;              // waiting for the worker
+    deque<Job> jobs;              // accepted, not taken by a worker yet
+    int inFlight = 0;             // taken by a worker and not fired yet
+    int idle = 0;                 // workers not holding a job
+    size_t pending = 0;           // accepted and not fired yet (async and sync)
+
+    // Rate limiting (429 / 529): one pause shared by every request. Each
+    // attempt remembers the wave it was sent in; only a 429 to an attempt
+    // sent after the latest pause started a new one, so a burst of in-flight
+    // requests all hitting the limit extends the pause once, not N times.
+    Clock::time_point pauseUntil{};
+    uint64_t pauseWave = 0;       // bumped when a pause starts
+    int rateLimitStreak = 0;      // pauses in a row without a request getting through
 
     // The fire slot: one thread fires responseEvent at a time (re-entrant for
     // that thread, so a listener may call request() or destroy the client).
     // A condition variable instead of a mutex, so a thread waiting for the
     // slot gives up when the client is destroyed: ~Client can then join the
-    // worker even when called from a listener that holds the slot.
+    // workers even when called from a listener that holds the slot.
     std::thread::id firingThread;
     int firingDepth = 0;
 
     // Runs the HTTP call with retries. Returns false (and fills nothing) when
-    // the client was destroyed during a backoff wait.
+    // the client was destroyed during a wait.
     bool perform(const Job& job, ResponseEventArgs& out) {
         TransportResponse res;
-        for (int attempt = 0;; ++attempt) {
+        int retries = 0, rateLimitRetries = 0;
+        for (;;) {
+            uint64_t wave = 0;
+            if (!waitForPause(wave)) return false;
             res = callTransport(job);
-            if (!isRetryable(res.statusCode) || attempt >= job.maxRetries) break;
-            float delay = backoffSeconds(attempt, job.retryInitial, job.retryMax);
+
+            if (isRateLimited(res.statusCode)) {
+                notePause(wave, job, res);
+                if (job.maxRetries > 0 && rateLimitRetries < kRateLimitRetries) {
+                    ++rateLimitRetries;
+                    continue;   // waitForPause() holds the retry until the pause ends
+                }
+                break;
+            }
+            if (res.statusCode != 0) noteThrough(wave);
+
+            if (!isRetryable(res.statusCode) || retries >= job.maxRetries) break;
+            float delay = backoffSeconds(retries, job.retryInitial, job.retryMax);
             logNotice(kLog) << "request #" << job.id << ": "
                             << redactKey(describeStatus(res), job.http.apiKey) << "; retry "
-                            << (attempt + 1) << "/" << job.maxRetries << " in "
+                            << (retries + 1) << "/" << job.maxRetries << " in "
                             << static_cast<int>(delay * 1000.0f + 0.5f) << " ms";
             if (!sleepUnlessStopped(delay)) return false;
+            ++retries;
         }
         out = parseResponse(job.id, res);
         out.error = redactKey(out.error, job.http.apiKey);
         if (!out.ok) logWarning(kLog) << "request #" << job.id << " failed: " << out.error;
         return true;
+    }
+
+    // Waits out the client-wide pause, then reports the wave this attempt is
+    // sent in. False when the client is destroyed meanwhile.
+    bool waitForPause(uint64_t& wave) {
+        std::unique_lock<Mutex> lock(mutex);
+        for (;;) {
+            if (stop) return false;
+            if (Clock::now() >= pauseUntil) {
+                wave = pauseWave;
+                return true;
+            }
+#if !defined(__EMSCRIPTEN__)
+            cv.wait_until(lock, pauseUntil);
+#else
+            wave = pauseWave;   // unreachable on web (request() refuses), but never spin
+            return true;
+#endif
+        }
+    }
+
+    // A 429 / 529 came back. Starts a new pause unless one already started
+    // after this attempt was sent (then this attempt just waits for it).
+    void notePause(uint64_t sentInWave, const Job& job, const TransportResponse& res) {
+        float delay;
+        {
+            std::lock_guard<Mutex> lock(mutex);
+            if (sentInWave != pauseWave) return;
+            ++pauseWave;
+            delay = backoffSeconds(rateLimitStreak, job.retryInitial, (std::max)(job.retryMax, kRateLimitMaxPause));
+            ++rateLimitStreak;
+            pauseUntil = Clock::now() + chrono::microseconds(static_cast<long long>(delay * 1e6f));
+        }
+        logNotice(kLog) << redactKey(describeStatus(res), job.http.apiKey) << ": pausing all requests for "
+                        << static_cast<int>(delay * 1000.0f + 0.5f) << " ms";
+    }
+
+    // Any other HTTP answer to an attempt sent after the latest pause: the
+    // limit let it through, so the next pause starts short again.
+    void noteThrough(uint64_t sentInWave) {
+        std::lock_guard<Mutex> lock(mutex);
+        if (sentInWave == pauseWave) rateLimitStreak = 0;
     }
 
     bool sleepUnlessStopped(float seconds) {
@@ -487,24 +569,40 @@ struct Client::State : std::enable_shared_from_this<Client::State> {
         {
             std::lock_guard<Mutex> lock(mutex);
             if (--firingDepth == 0) firingThread = std::thread::id();
+            if (pending > 0) --pending;
         }
 #if !defined(__EMSCRIPTEN__)
         cv.notify_all();
 #endif
     }
 
+    // Fires the event of a request that was dropped before it was sent.
+    void fireCancelled(uint64_t id) {
+        ResponseEventArgs r;
+        r.requestId = id;
+        r.cancelled = true;
+        r.error = "cancelled";
+        fire(r);
+    }
+
 #if !defined(__EMSCRIPTEN__)
-    // Starts the worker on first use. Called with `mutex` held (so it doesn't
-    // log); returns an error text, empty on success.
-    string ensureWorker() {
-        if (worker.joinable()) return "";
-        try {
-            auto self = shared_from_this();
-            worker = std::thread([self] { self->workerLoop(); });
-            return "";
-        } catch (const std::exception& e) {
-            return e.what();
+    // Starts workers until every queued job has one, up to maxConcurrent.
+    // Called with `mutex` held (so it doesn't log); returns an error text when
+    // no worker is running at all, empty otherwise.
+    string ensureWorkers() {
+        string error;
+        while (!stop && jobs.size() > static_cast<size_t>(idle) &&
+               workers.size() < static_cast<size_t>(maxConcurrent)) {
+            try {
+                auto self = shared_from_this();
+                workers.emplace_back([self] { self->workerLoop(); });
+                ++idle;
+            } catch (const std::exception& e) {
+                error = e.what();
+                break;
+            }
         }
+        return workers.empty() ? error : string();
     }
 
     void workerLoop() {
@@ -512,14 +610,25 @@ struct Client::State : std::enable_shared_from_this<Client::State> {
             Job job;
             {
                 std::unique_lock<Mutex> lock(mutex);
-                cv.wait(lock, [this] { return stop || !jobs.empty(); });
+                cv.wait(lock, [this] { return stop || (!jobs.empty() && inFlight < maxConcurrent); });
                 if (stop) return;
                 job = std::move(jobs.front());
                 jobs.pop_front();
+                ++inFlight;
+                --idle;
             }
             ResponseEventArgs out;
-            if (!perform(job, out)) return;
-            fire(out);
+            bool finished = perform(job, out);
+            // The slot is held until the event fired, so with maxConcurrent 1
+            // the next request can't overtake this one.
+            if (finished) fire(out);
+            {
+                std::lock_guard<Mutex> lock(mutex);
+                --inFlight;
+                ++idle;
+            }
+            cv.notify_all();
+            if (!finished) return;
         }
     }
 #endif
@@ -561,13 +670,17 @@ Client::~Client() {
     }
 #if !defined(__EMSCRIPTEN__)
     s->cv.notify_all();
-    if (s->worker.joinable()) {
-        if (s->worker.get_id() == std::this_thread::get_id()) {
-            // Destroyed from a listener running on the worker: it can't join
+    // No new worker can start now (stop is set), so `workers` is stable. The
+    // in-flight calls end concurrently; joining them one by one waits for the
+    // slowest, not their sum.
+    for (auto& w : s->workers) {
+        if (!w.joinable()) continue;
+        if (w.get_id() == std::this_thread::get_id()) {
+            // Destroyed from a listener running on this worker: it can't join
             // itself. It exits on its own (stop is set) and owns `s`.
-            s->worker.detach();
+            w.detach();
         } else {
-            s->worker.join();
+            w.join();
         }
     }
 #endif
@@ -622,6 +735,25 @@ Client& Client::setRetryDelay(float initialSeconds, float maxSeconds) {
     state_->retryInitial = (std::max)(initialSeconds, 0.0f);
     state_->retryMax = (std::max)(maxSeconds, state_->retryInitial);
     return *this;
+}
+
+Client& Client::setMaxConcurrent(int n) {
+    {
+        std::lock_guard<Mutex> lock(state_->mutex);
+        state_->maxConcurrent = (std::max)(n, 1);
+#if !defined(__EMSCRIPTEN__)
+        if (state_->async) state_->ensureWorkers();   // more room: start workers for what is queued
+#endif
+    }
+#if !defined(__EMSCRIPTEN__)
+    state_->cv.notify_all();
+#endif
+    return *this;
+}
+
+int Client::getMaxConcurrent() const {
+    std::lock_guard<Mutex> lock(state_->mutex);
+    return state_->maxConcurrent;
 }
 
 Client& Client::setTransport(Transport transport) {
@@ -702,12 +834,14 @@ uint64_t Client::request(const Request& req) {
         job.transport = s->transport;
         async = s->async;
         if (async) {
-            workerError = s->ensureWorker();
-            if (workerError.empty()) s->jobs.push_back(job);
+            s->jobs.push_back(job);
+            workerError = s->ensureWorkers();
+            if (!workerError.empty()) s->jobs.pop_back();
         }
+        if (workerError.empty()) ++s->pending;
     }
     if (!workerError.empty()) {
-        logError(kLog) << "request(): could not start the worker thread: " << workerError;
+        logError(kLog) << "request(): could not start a worker thread: " << workerError;
         return 0;
     }
     uint64_t id = job.id;
@@ -721,6 +855,34 @@ uint64_t Client::request(const Request& req) {
     if (s->perform(job, out)) s->fire(out);
     return id;
 #endif
+}
+
+size_t Client::getPendingCount() const {
+    std::lock_guard<Mutex> lock(state_->mutex);
+    return state_->pending;
+}
+
+bool Client::cancel(uint64_t id) {
+    auto s = state_;   // a listener fired below may destroy this client
+    {
+        std::lock_guard<Mutex> lock(s->mutex);
+        auto it = std::find_if(s->jobs.begin(), s->jobs.end(), [id](const Job& j) { return j.id == id; });
+        if (it == s->jobs.end()) return false;
+        s->jobs.erase(it);
+    }
+    s->fireCancelled(id);
+    return true;
+}
+
+size_t Client::cancelAll() {
+    auto s = state_;   // a listener fired below may destroy this client
+    deque<Job> dropped;
+    {
+        std::lock_guard<Mutex> lock(s->mutex);
+        dropped.swap(s->jobs);
+    }
+    for (const auto& job : dropped) s->fireCancelled(job.id);
+    return dropped.size();
 }
 
 } // namespace tcx::jev

@@ -6,15 +6,18 @@
 // to a scripted fake server, so no API key or network is needed.
 //
 // Covers: request JSON for all question types + the raw form, response parsing,
-// errors and retries, request ids, async FIFO, which thread responseEvent fires
-// on (plain listeners vs tc::Deliver::Main), sync mode, client destruction with
-// work pending (incl. from inside a listener), the async decision function, and
-// that the API key never reaches a log line.
+// errors and retries, the client-wide rate-limit pause, request ids, async FIFO
+// with setMaxConcurrent(1), concurrent requests (cap, completion order, runtime
+// changes, listeners never overlapping), pending count and cancellation, which
+// thread responseEvent fires on (plain listeners vs tc::Deliver::Main), sync
+// mode, client destruction with work pending (incl. from inside a listener),
+// the async decision function, and that the API key never reaches a log line.
 // =============================================================================
 
 #include <TrussC.h>
 #include <tcxJev.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -105,7 +108,27 @@ struct LogCapture {
         }
         return false;
     }
+    int countSince(size_t from, const string& needle) {
+        lock_guard<mutex> lock(m);
+        int n = 0;
+        for (size_t i = from; i < lines.size(); ++i) {
+            if (lines[i].second.find(needle) != string::npos) ++n;
+        }
+        return n;
+    }
 };
+
+// The `state` a request body carries (tests tag requests by their state).
+static string stateOf(const TransportRequest& req) {
+    Json b = Json::parse(req.body, nullptr, false);
+    return b.is_object() && b["state"].is_string() ? b["state"].get<string>() : string();
+}
+
+// Records the highest value `counter` reaches.
+static void trackMax(atomic<int>& maxSeen, int now) {
+    int prev = maxSeen.load();
+    while (now > prev && !maxSeen.compare_exchange_weak(prev, now)) {}
+}
 
 // Blocks a transport call until released (bounded, so a bug can't hang CI).
 struct Gate {
@@ -514,8 +537,8 @@ static void testErrors() {
         useFake(c, server);
         server.fallback = reply(529, R"({"message":"overloaded"})");
         ResponseEventArgs e = roundTrip(c, simpleRequest());
-        check("529 always: 1 + 3 retries, then fails",
-              server.calls == 4 && !e.ok && e.statusCode == 529 && e.error.find("Overloaded") != string::npos &&
+        check("529 always: 1 + 10 rate-limit retries, then fails",
+              server.calls == 11 && !e.ok && e.statusCode == 529 && e.error.find("Overloaded") != string::npos &&
                   e.error.find("overloaded") != string::npos);
     }
     {
@@ -581,6 +604,103 @@ static void testErrors() {
 }
 
 // ---------------------------------------------------------------------------
+// C2. Rate limiting (429 / 529): own retry budget, one client-wide pause
+// ---------------------------------------------------------------------------
+
+static void testRateLimit(LogCapture& logs) {
+    {
+        FakeServer server;
+        Client c;
+        useFake(c, server);
+        c.setMaxRetries(1);
+        for (int i = 0; i < 3; ++i) server.push(reply(429, "{}"));
+        ResponseEventArgs e = roundTrip(c, simpleRequest());
+        check("429: retried apart from setMaxRetries() (3 x 429, maxRetries 1)", server.calls == 4 && e.ok);
+    }
+    {
+        FakeServer server;
+        Client c;
+        useFake(c, server);
+        c.setMaxRetries(0);
+        server.push(reply(429, "{}"));
+        ResponseEventArgs e = roundTrip(c, simpleRequest());
+        check("429 with setMaxRetries(0): not retried", server.calls == 1 && !e.ok && e.statusCode == 429);
+    }
+    {
+        FakeServer server;
+        Client c;
+        useFake(c, server);
+        server.fallback = reply(429, "{}");
+        ResponseEventArgs e = roundTrip(c, simpleRequest());
+        check("429 always: 1 + 10 rate-limit retries, then fails",
+              server.calls == 11 && !e.ok && e.statusCode == 429);
+    }
+    {
+        // Two workers; the first call gets a 429. Every call that starts after
+        // it (the retry and the queued requests) waits out the pause, not just
+        // the request that got the 429.
+        using Clock = chrono::steady_clock;
+        const auto t0 = Clock::now();
+        mutex m;
+        vector<pair<int, double>> starts;   // call index, start time
+        atomic<int> calls{0};
+        Client c;
+        c.setApiKey(kKey).setMaxConcurrent(2).setRetryDelay(0.2f, 0.2f);
+        c.setTransport([&](const TransportRequest&) {
+            int i = calls++;
+            {
+                lock_guard<mutex> lock(m);
+                starts.push_back({i, chrono::duration<double>(Clock::now() - t0).count()});
+            }
+            if (i == 0) return reply(429, "{}");
+            sleepMs(5);
+            return reply(200, kNoulBody);
+        });
+        Collector col;
+        col.attach(c);
+        size_t mark = logs.size();
+        for (int i = 0; i < 5; ++i) c.request(simpleRequest(i));
+        bool all = waitFor([&] { return col.count == 5; });
+        double firstAfter = 1e9;
+        {
+            lock_guard<mutex> lock(m);
+            for (auto& [i, t] : starts) {
+                if (i >= 2) firstAfter = (std::min)(firstAfter, t);
+            }
+        }
+        bool allOk = true;
+        for (int i = 0; i < 5; ++i) allOk &= col.at(i).ok;
+        check("429: pauses every request of the client (later calls wait >= pause - jitter)",
+              all && allOk && calls == 6 && firstAfter >= 0.14);
+        check("429: the pause is logged once", logs.countSince(mark, "pausing all requests") == 1);
+    }
+    {
+        // Four requests in flight all get a 429: they were sent in the same
+        // wave, so the pause starts once instead of growing four times.
+        atomic<int> arrived{0}, calls{0};
+        Client c;
+        c.setApiKey(kKey).setMaxConcurrent(4).setRetryDelay(0.02f, 0.02f);
+        c.setTransport([&](const TransportRequest&) {
+            if (calls++ < 4) {
+                ++arrived;
+                waitFor([&] { return arrived >= 4; }, 2000);   // all four in flight at once
+                return reply(429, "{}");
+            }
+            return reply(200, kNoulBody);
+        });
+        Collector col;
+        col.attach(c);
+        size_t mark = logs.size();
+        for (int i = 0; i < 4; ++i) c.request(simpleRequest(i));
+        bool all = waitFor([&] { return col.count == 4; });
+        bool allOk = true;
+        for (int i = 0; i < 4; ++i) allOk &= col.at(i).ok;
+        check("429 burst from one wave: one pause, then every request succeeds",
+              all && allOk && calls == 8 && logs.countSince(mark, "pausing all requests") == 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // D. Ids, rejected requests, API key sources
 // ---------------------------------------------------------------------------
 
@@ -632,7 +752,7 @@ static void testIds(LogCapture& logs) {
 }
 
 // ---------------------------------------------------------------------------
-// E. Async: FIFO on one worker
+// E. Async with setMaxConcurrent(1): FIFO, one call at a time
 // ---------------------------------------------------------------------------
 
 static void testAsyncFifo() {
@@ -643,7 +763,7 @@ static void testAsyncFifo() {
         sleepMs(1 + (7 - i % 7));   // uneven latencies
     };
     Client c;
-    c.setApiKey(kKey).setTransport(server.transport());
+    c.setApiKey(kKey).setTransport(server.transport()).setMaxConcurrent(1);
     Collector col;
     col.attach(c);   // plain listen(): runs where the event fires
     const int N = 10;
@@ -667,6 +787,186 @@ static void testAsyncFifo() {
 }
 
 // ---------------------------------------------------------------------------
+// E2. Concurrent requests (setMaxConcurrent > 1)
+// ---------------------------------------------------------------------------
+
+static void testConcurrency() {
+    {
+        Client c;
+        check("defaults: maxConcurrent 10", c.getMaxConcurrent() == 10);
+        c.setMaxConcurrent(0);
+        check("setMaxConcurrent(0) clamps to 1", c.getMaxConcurrent() == 1);
+    }
+    {
+        FakeServer server;
+        server.hook = [](int) { sleepMs(30); };
+        Client c;
+        c.setApiKey(kKey).setTransport(server.transport()).setMaxConcurrent(3);
+        Collector col;
+        col.attach(c);
+        const int N = 12;
+        for (int i = 0; i < N; ++i) c.request(simpleRequest(i));
+        bool all = waitFor([&] { return col.count == N; });
+        vector<uint64_t> ids = col.ids(), want;
+        sort(ids.begin(), ids.end());
+        for (int i = 1; i <= N; ++i) want.push_back(static_cast<uint64_t>(i));
+        check("concurrent: every request answered, each id once", all && ids == want);
+        check("concurrent: at most setMaxConcurrent() calls in flight", server.maxInFlight == 3);
+    }
+    {
+        // Request #1 is held back; #2..#4 must not wait for it.
+        Gate gate;
+        Client c;   // default: 10 at once
+        c.setApiKey(kKey).setTransport([&](const TransportRequest& req) {
+            if (stateOf(req) == "state 0") gate.wait();
+            return reply(200, kNoulBody);
+        });
+        Collector col;
+        col.attach(c);
+        for (int i = 0; i < 4; ++i) c.request(simpleRequest(i));
+        bool others = waitFor([&] { return col.count == 3; });
+        gate.release();
+        bool all = waitFor([&] { return col.count == 4; });
+        vector<uint64_t> ids = col.ids();
+        check("concurrent: a slow request doesn't hold back the others", others && all);
+        check("concurrent: responses fire in completion order", ids.size() == 4 && ids.back() == 1);
+    }
+    {
+        // Workers answer at the same time; listeners are still called one at a time.
+        FakeServer server;
+        Client c;
+        c.setApiKey(kKey).setTransport(server.transport()).setMaxConcurrent(8);
+        atomic<int> inside{0}, maxInside{0}, count{0};
+        EventListener l = c.responseEvent.listen([&](ResponseEventArgs&) {
+            trackMax(maxInside, ++inside);
+            sleepMs(3);
+            --inside;
+            ++count;
+        });
+        for (int i = 0; i < 16; ++i) c.request(simpleRequest(i));
+        bool all = waitFor([&] { return count == 16; });
+        check("concurrent: listeners never run at the same time", all && maxInside == 1);
+    }
+    {
+        // Raising the limit starts more of what is already queued, right away.
+        Gate gate;
+        atomic<int> started{0};
+        Client c;
+        c.setApiKey(kKey).setMaxConcurrent(1).setTransport([&](const TransportRequest&) {
+            ++started;
+            gate.wait();
+            return reply(200, kNoulBody);
+        });
+        Collector col;
+        col.attach(c);
+        for (int i = 0; i < 6; ++i) c.request(simpleRequest(i));
+        bool one = waitFor([&] { return started == 1; });
+        sleepMs(30);
+        bool stillOne = started == 1;
+        c.setMaxConcurrent(3);
+        bool three = waitFor([&] { return started == 3; });
+        gate.release();
+        bool all = waitFor([&] { return col.count == 6; });
+        check("setMaxConcurrent: raising it starts queued requests right away", one && stillOne && three && all);
+    }
+    {
+        // Lowering it: the running calls finish, then the rest go one at a time.
+        Gate gate;
+        atomic<int> started{0}, inFlight{0};
+        mutex m;
+        vector<int> inFlightAtStart;
+        Client c;
+        c.setApiKey(kKey).setMaxConcurrent(4).setTransport([&](const TransportRequest&) {
+            int now = ++inFlight;
+            {
+                lock_guard<mutex> lock(m);
+                inFlightAtStart.push_back(now);
+            }
+            if (++started <= 4) gate.wait();
+            --inFlight;
+            return reply(200, kNoulBody);
+        });
+        Collector col;
+        col.attach(c);
+        for (int i = 0; i < 8; ++i) c.request(simpleRequest(i));
+        bool four = waitFor([&] { return started == 4; });
+        c.setMaxConcurrent(1);
+        gate.release();
+        bool all = waitFor([&] { return col.count == 8; });
+        bool serial = true;
+        {
+            lock_guard<mutex> lock(m);
+            for (size_t i = 4; i < inFlightAtStart.size(); ++i) serial &= inFlightAtStart[i] == 1;
+        }
+        check("setMaxConcurrent: lowering it runs the rest one at a time", four && all && serial);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E3. Pending count and cancellation
+// ---------------------------------------------------------------------------
+
+static void testQueueControl() {
+    {
+        Gate gate;
+        mutex m;
+        vector<string> sent;
+        Client c;
+        c.setApiKey(kKey).setMaxConcurrent(1).setTransport([&](const TransportRequest& req) {
+            {
+                lock_guard<mutex> lock(m);
+                sent.push_back(stateOf(req));
+            }
+            if (stateOf(req) == "state 0") gate.wait();
+            return reply(200, kNoulBody);
+        });
+        Collector col, mainCol;
+        col.attach(c);
+        mainCol.attach(c, Deliver::Main);
+        check("pending: 0 on a fresh client", c.getPendingCount() == 0);
+        for (int i = 0; i < 4; ++i) c.request(simpleRequest(i));   // ids 1..4, #1 held at the gate
+        waitFor([&] { return gate.reached.load(); });
+        check("pending: queued + being sent", c.getPendingCount() == 4);
+
+        bool cancelled2 = c.cancel(2);
+        ResponseEventArgs e2 = col.at(0);
+        check("cancel: queued request -> true, its event fires before cancel() returns",
+              cancelled2 && col.count == 1 && e2.requestId == 2);
+        check("cancel: event says cancelled (not ok, status 0)",
+              e2.cancelled && !e2.ok && e2.statusCode == 0 && e2.error == "cancelled");
+        check("cancel: fires on the calling thread; Deliver::Main runs at once there",
+              col.onMain[0] && mainCol.count == 1);
+        check("cancel: the same id again -> false", !c.cancel(2));
+        check("cancel: the request being sent -> false", !c.cancel(1));
+        check("cancel: an unknown id -> false", !c.cancel(99));
+        check("pending: drops with the cancel", c.getPendingCount() == 3);
+
+        size_t n = c.cancelAll();
+        check("cancelAll: drops the rest of the queue, each fires once in id order",
+              n == 2 && col.count == 3 && col.at(1).requestId == 3 && col.at(2).requestId == 4 &&
+                  col.at(1).cancelled && col.at(2).cancelled);
+        check("pending: only the request being sent is left", c.getPendingCount() == 1);
+        check("cancelAll: nothing queued -> 0", c.cancelAll() == 0);
+
+        gate.release();
+        bool answered = waitFor([&] { return col.count == 4; });
+        ResponseEventArgs e1 = col.at(3);
+        check("cancel: the request being sent still answers normally",
+              answered && e1.requestId == 1 && e1.ok && !e1.cancelled);
+        check("pending: 0 once everything fired", c.getPendingCount() == 0);
+        lock_guard<mutex> lock(m);
+        check("cancel: cancelled requests were never sent", sent == vector<string>({"state 0"}));
+    }
+    {
+        FakeServer server;
+        Client c;
+        useFake(c, server);
+        c.request(simpleRequest());
+        check("pending: sync request -> 0 once request() returns", c.getPendingCount() == 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // F. Deliver::Main listeners: main thread, next frame, in order
 // ---------------------------------------------------------------------------
 
@@ -675,7 +975,7 @@ static void testMainThreadDelivery() {
     Gate gate;
     server.hook = [&](int i) { if (i == 3) gate.wait(); };
     Client c;
-    c.setApiKey(kKey).setTransport(server.transport());
+    c.setApiKey(kKey).setTransport(server.transport()).setMaxConcurrent(1);
     check("defaults: async on", c.isAsync());
     Collector col;
     col.attach(c, Deliver::Main);
@@ -774,7 +1074,7 @@ static void testDestruction() {
         auto t0 = chrono::steady_clock::now();
         {
             Client c;
-            c.setApiKey(kKey).setTransport(server.transport());
+            c.setApiKey(kKey).setTransport(server.transport()).setMaxConcurrent(1);
             col.attach(c);
             for (int i = 0; i < 3; ++i) c.request(simpleRequest(i));
             waitFor([&] { return server.calls == 1; });
@@ -825,7 +1125,7 @@ static void testDestruction() {
         Gate gate;
         server.hook = [&](int i) { if (i == 0) gate.wait(); };
         auto c = make_unique<Client>();
-        c->setApiKey(kKey).setTransport(server.transport());
+        c->setApiKey(kKey).setTransport(server.transport()).setMaxConcurrent(1);
         Collector col;
         col.attach(*c);
         atomic<bool> destroyed{false};
@@ -877,6 +1177,55 @@ static void testDestruction() {
         t.join();
         check("destroy from a sync listener: the waiting worker response never fires",
               firedB == 1 && firedA == 0);
+    }
+    {
+        // Several calls in flight at once: the destructor waits for them
+        // together, nothing fires, and the queued requests never start.
+        FakeServer server;
+        server.hook = [](int) { sleepMs(150); };
+        Collector col;
+        auto t0 = chrono::steady_clock::now();
+        {
+            Client c;
+            c.setApiKey(kKey).setTransport(server.transport()).setMaxConcurrent(4);
+            col.attach(c);
+            for (int i = 0; i < 6; ++i) c.request(simpleRequest(i));
+            waitFor([&] { return server.calls >= 4; });
+        }
+        double took = chrono::duration<double>(chrono::steady_clock::now() - t0).count();
+        drainFrame();
+        sleepMs(50);
+        drainFrame();
+        check("destroy with 4 in flight: nothing fires, the queued 2 never start",
+              col.count == 0 && server.calls == 4);
+        check("destroy with 4 in flight: waits for them together (~1 call, not 4)", took < 0.45);
+    }
+    {
+        // Destroyed by its own listener on one worker while three other
+        // workers are mid-call: it joins them, and they fire nothing.
+        FakeServer server;
+        Gate gate;
+        server.hook = [&](int i) {
+            gate.wait();
+            sleepMs(i == 0 ? 10 : 120);
+        };
+        auto c = make_unique<Client>();
+        c->setApiKey(kKey).setTransport(server.transport()).setMaxConcurrent(4);
+        Collector col;
+        col.attach(*c);
+        atomic<bool> destroyed{false};
+        col.extra = [&](ResponseEventArgs&) {
+            c.reset();
+            destroyed = true;
+        };
+        for (int i = 0; i < 4; ++i) c->request(simpleRequest(i));
+        waitFor([&] { return server.calls == 4; });
+        gate.release();
+        bool gone = waitFor([&] { return destroyed.load(); });
+        sleepMs(200);
+        drainFrame();
+        check("destroy from a worker listener with 3 other calls in flight: no crash, nothing else fires",
+              gone && col.count == 1 && server.done == 4);
     }
     {
         Client unused;   // never started a worker
@@ -960,8 +1309,11 @@ int main() {
     testRequestJson();
     testParsing();
     testErrors();
+    testRateLimit(logs);
     testIds(logs);
     testAsyncFifo();
+    testConcurrency();
+    testQueueControl();
     testMainThreadDelivery();
     testDeliverMainMix();
     testSync();

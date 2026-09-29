@@ -77,7 +77,8 @@ One request can carry many questions; they are all evaluated against the same
 state in one call. Batching the questions about one state into one request is
 about 10x cheaper and faster than one request per question (TypeSafe's
 [parallel questions](https://docs.typesafe.ai/cookbooks/parallel_questions)
-cookbook), and it matters here because the worker sends one request at a time.
+cookbook). Different states need separate requests; those run concurrently
+(see [Many requests](#many-requests)).
 
 ## Building a request
 
@@ -109,13 +110,14 @@ There is also a raw form that takes the API's `questions` object directly:
 
 ## Reading the response
 
-`responseEvent` fires once for every request that `request()` accepted,
-successful or not. `ResponseEventArgs`:
+`responseEvent` fires once for every request that `request()` accepted:
+answered, failed or cancelled. `ResponseEventArgs`:
 
 | Field | Meaning |
 |-------|---------|
 | `requestId` | The id `request()` returned (ids start at 1 and increase). |
 | `ok` | `true` when `answers` is valid. |
+| `cancelled` | `true` when `cancel()` / `cancelAll()` dropped it before it was sent. |
 | `statusCode` | HTTP status of the last attempt; `0` = no HTTP response (network error, timeout). |
 | `error` | What went wrong (empty when `ok`). |
 | `model` | The versioned model that answered, e.g. `jev-1.13.0`. |
@@ -145,7 +147,7 @@ that same thread:
 
 | `setAsync` | HTTP call runs | `responseEvent` fires |
 |------------|----------------|------------------------|
-| `true` (default) | On one worker thread, FIFO, one request at a time | On the worker, as each response arrives, in request order |
+| `true` (default) | On worker threads, up to `setMaxConcurrent()` requests at a time (default 10), started in request order | On the worker that ran it, as each response arrives: in completion order (in request order with `setMaxConcurrent(1)`) |
 | `false` | Inside `request()`, on the calling thread (blocks, retries included) | On the calling thread, before `request()` returns |
 
 Like every `tc::Event` fired off the main thread (network receive events, for
@@ -159,16 +161,64 @@ example), each listener chooses where it runs:
 - `request()` returns an id right away (async) so you can match responses to
   requests. It returns `0`, and logs why, when the request could not be queued
   (no questions, no API key, web build).
-- The worker starts on the first async request.
+- Listeners are never called concurrently, even with several workers: one
+  response fires at a time.
+- Worker threads start as requests queue up, never more than
+  `setMaxConcurrent()`, and stay (idle) until the client is destroyed; a
+  client that sends one request at a time uses one.
 - `Deliver::Main` needs the TrussC frame loop (`runApp` / `runHeadlessApp`);
   in a plain `main()` without it, listen without `Deliver::Main`.
 - Switching `setAsync(false)` does not cancel requests already queued; they
-  finish on the worker.
+  finish on the workers.
 - Destroying the `Client` drops queued requests, and nothing fires after the
   destructor returns (`Deliver::Main` calls still waiting for a frame are
-  dropped with the event). It waits for an HTTP call already in progress (at
-  most the timeout) and for a listener running on another thread. It is safe
-  to destroy the client from inside its own listener.
+  dropped with the event). It waits for HTTP calls already in progress (they
+  end together, so at most one timeout) and for a listener running on another
+  thread. It is safe to destroy the client from inside its own listener.
+
+## Many requests
+
+Questions about one state belong in one request. When the states differ
+(classifying a thousand texts, say), send one request each; the client runs up
+to `setMaxConcurrent()` of them at once (default 10), so a few hundred short
+requests take seconds instead of minutes. Just call `request()` in a loop and
+match the answers by id:
+
+```cpp
+map<uint64_t, int> idToText;   // request id -> index into texts
+
+void tcApp::classifyAll() {    // once, not every frame
+    for (int i = 0; i < (int)texts.size(); i++) {
+        uint64_t id = jev.request(Request()
+            .state(texts[i])
+            .choice("topic", "What is this text about?", topics));
+        idToText[id] = i;
+    }
+}
+
+// in the Deliver::Main listener:
+//     results[idToText[e.requestId]] = e.answers["topic"].choice;
+```
+
+- **Responses arrive in completion order.** Match them by `requestId`, not by
+  arrival. If you show "the latest answer" for an input that keeps changing
+  (text being typed, say), an older request can finish after a newer one;
+  ignore it by id, which only ever grows:
+
+  ```cpp
+  if (e.requestId > shownId) { shownId = e.requestId; show(e); }
+  ```
+
+  `setMaxConcurrent(1)` sends one request at a time and keeps request order.
+- **Don't queue faster than it drains.** A `request()` in `update()` on every
+  frame queues 60 per second. `getPendingCount()` (requests whose response has
+  not fired yet) lets you throttle: `if (jev.getPendingCount() < 3) jev.request(...)`.
+- **Drop what is no longer wanted.** `cancel(id)` removes a request that has
+  not been sent yet and `cancelAll()` empties the queue; each dropped request
+  still fires once, right away on the calling thread, with `cancelled` set.
+  Requests already being sent can't be cancelled (they are billed anyway).
+- The API allows 1200 requests per minute per key (see
+  [Errors and retries](#errors-and-retries) for what happens beyond that).
 
 ## API key
 
@@ -199,17 +249,28 @@ example), each listener chooses where it runs:
 | 400 | The request was rejected: an invalid question or model (e.g. a Choice with no options, more than 10 Score levels, an unknown model); `error` carries the reason | no |
 | 401 | Missing or invalid API key | no |
 | 422 | The request body failed schema validation (e.g. a missing field such as `state`) | no |
-| 429 | Rate limited | yes |
-| 529 | Overloaded | yes |
+| 429 | Rate limited | yes, pauses the whole client |
+| 529 | Overloaded | yes, pauses the whole client |
 | 408, other 5xx | Timeout / server error | yes |
 | 0 | No HTTP response (connection failure, timeout) | yes |
 
 - Retries: `setMaxRetries(n)` (default 3 retries after the first attempt, 0
-  disables), with exponential backoff `setRetryDelay(initial, max)` (default
-  0.5 s doubling up to 8 s, minus up to 25% random jitter). A `Retry-After`
-  header is not honored (tcxCurl does not expose response headers).
+  disables every retry), with exponential backoff `setRetryDelay(initial, max)`
+  (default 0.5 s doubling up to 8 s, minus up to 25% random jitter). A
+  `Retry-After` header is not honored (tcxCurl does not expose response
+  headers).
+- 429 and 529 mean "slow down", not "this request is broken", so they are
+  handled differently: the whole client pauses (no request of this client is
+  sent until the pause ends), then the request is sent again. The pause starts
+  at the retry delay and doubles, up to 30 s, while the limit keeps answering
+  429; the in-flight requests that hit the limit at the same moment share one
+  pause instead of stretching it. These retries don't count toward
+  `setMaxRetries()`: a request gets up to 10 of them (about two minutes with
+  the defaults) before it fails with the 429 / 529. So a large batch slows
+  down to what the limit allows instead of failing.
 - `setTimeout(seconds)` bounds each HTTP attempt (default 30 s).
-- Failures are also logged as warnings (`[tcxJev]`), retries as notices.
+- Failures are also logged as warnings (`[tcxJev]`), retries and pauses as
+  notices.
 
 ## Custom transport
 
@@ -226,9 +287,10 @@ jev.setTransport([](const TransportRequest& req) {
 });
 ```
 
-It runs on the worker thread (async) or the calling thread (sync), one call at
-a time per client. With a custom transport `request()` doesn't require an API
-key. An empty function restores the default tcxCurl transport.
+It runs on a worker thread (async) or the calling thread (sync), up to
+`getMaxConcurrent()` calls at a time per client, so it must be thread-safe
+(or call `setMaxConcurrent(1)`). With a custom transport `request()` doesn't
+require an API key. An empty function restores the default tcxCurl transport.
 
 ## Platforms
 
