@@ -1,0 +1,8 @@
+{
+  "description": "Client for TypeSafe's Jev model: typed yes/no, choice and score answers about text or JSON",
+  "author": "tettou771",
+  "license": "MIT",
+  "category": "ai",
+  "keywords": ["typesafe", "jev", "system-one", "classification", "scoring", "llm", "api"],
+  "dependencies": ["tcxCurl"]
+}
