@@ -9,10 +9,11 @@
 #include <deque>
 #include <random>
 
+#include <thread>
+
 #if !defined(__EMSCRIPTEN__)
 #include <condition_variable>
 #include <mutex>
-#include <thread>
 #endif
 
 using namespace std;
@@ -39,11 +40,9 @@ struct NoMutex {
     bool try_lock() { return true; }
 };
 using Mutex = NoMutex;
-using RecursiveMutex = NoMutex;
 #else
 constexpr bool kThreadsAvailable = true;
 using Mutex = std::mutex;
-using RecursiveMutex = std::recursive_mutex;
 #endif
 
 string trimmed(const string& s) {
@@ -391,19 +390,18 @@ Json Request::toJson(const string& defaultModel) const {
 }
 
 // =============================================================================
-// Client::State - everything the worker and queued main-thread drains touch.
-// Shared-owned, so a worker or a drain that outlives the Client still has valid
-// memory; `owner` (cleared by ~Client under fireMutex) says whether to fire.
+// Client::State - everything the worker touches. Shared-owned, so a worker
+// that outlives its Client (destroyed from one of its own listeners) still has
+// valid memory; `owner` says whether there is anything left to fire.
 // =============================================================================
 
 struct Client::State : std::enable_shared_from_this<Client::State> {
-    Mutex mutex;                  // everything below except `owner`
-    RecursiveMutex fireMutex;     // held while firing; ~Client takes it to clear `owner`
-    Client* owner = nullptr;
+    Mutex mutex;                  // guards everything below
 #if !defined(__EMSCRIPTEN__)
-    std::condition_variable cv;   // new job / stop
+    std::condition_variable cv;   // new job, stop, fire slot released
     std::thread worker;
 #endif
+    Client* owner = nullptr;      // cleared by ~Client while no other thread fires
 
     // Settings
     string apiKey;
@@ -413,15 +411,19 @@ struct Client::State : std::enable_shared_from_this<Client::State> {
     float retryInitial = 0.5f;
     float retryMax = 8.0f;
     bool async = kThreadsAvailable;
-    bool eventAsync = false;
     Transport transport;
 
     uint64_t nextId = 1;
     bool stop = false;
-    deque<Job> jobs;                       // waiting for the worker
-    deque<ResponseEventArgs> pending;      // done, waiting to fire
-    bool draining = false;                 // some thread is firing `pending`
-    bool drainScheduled = false;           // a main-thread drain is queued
+    deque<Job> jobs;              // waiting for the worker
+
+    // The fire slot: one thread fires responseEvent at a time (re-entrant for
+    // that thread, so a listener may call request() or destroy the client).
+    // A condition variable instead of a mutex, so a thread waiting for the
+    // slot gives up when the client is destroyed: ~Client can then join the
+    // worker even when called from a listener that holds the slot.
+    std::thread::id firingThread;
+    int firingDepth = 0;
 
     // Runs the HTTP call with retries. Returns false (and fills nothing) when
     // the client was destroyed during a backoff wait.
@@ -454,68 +456,32 @@ struct Client::State : std::enable_shared_from_this<Client::State> {
 #endif
     }
 
-    // Hands a finished response to whoever should fire it: queued for the
-    // main thread, or fired now on this thread (the responses before it first).
-    void deliver(ResponseEventArgs&& r) {
-        std::unique_lock<Mutex> lock(mutex);
-        if (stop) return;
-        pending.push_back(std::move(r));
-        if (!eventAsync && !isMainThread()) {
-            scheduleMainDrain(lock);
-            return;
-        }
-        if (draining) return;   // the thread already firing will reach it, in order
-        drain(lock);
-    }
-
-    // Queues one main-thread drain (at most one outstanding). Unlocks `lock`.
-    void scheduleMainDrain(std::unique_lock<Mutex>& lock) {
-        if (drainScheduled) {
-            lock.unlock();
-            return;
-        }
-        drainScheduled = true;
-        std::weak_ptr<State> weak = shared_from_this();
-        lock.unlock();
-        runOnMainThread([weak] {
-            if (auto s = weak.lock()) s->drainOnMain();
-        });
-    }
-
-    void drainOnMain() {
-        std::unique_lock<Mutex> lock(mutex);
-        drainScheduled = false;
-        if (stop || draining) return;
-        drain(lock);
-    }
-
-    // Fires `pending` in order until it is empty. Called with `lock` held and
-    // `draining` false; only one thread drains at a time, so order holds even
-    // when a switch of setResponseEventAsync() races the worker. The mutex is
-    // released around each listener call, so listeners may call back into the
-    // client (request(), setters, even destroy it).
-    void drain(std::unique_lock<Mutex>& lock) {
-        draining = true;
-        while (!pending.empty() && !stop) {
-            if (!eventAsync && !isMainThread()) {
-                // Main-thread delivery came back on while this thread was
-                // firing: the rest goes to the main thread.
-                draining = false;
-                scheduleMainDrain(lock);
-                return;
-            }
-            ResponseEventArgs r = std::move(pending.front());
-            pending.pop_front();
-            lock.unlock();
-            fire(r);
-            lock.lock();
-        }
-        draining = false;
-    }
-
+    // Fires responseEvent on this thread; each listener's Deliver decides
+    // where it actually runs. Nothing fires once the client is destroyed.
     void fire(ResponseEventArgs& r) {
-        std::lock_guard<RecursiveMutex> guard(fireMutex);
-        if (owner) owner->responseEvent.notify(r);
+        Client* target = nullptr;
+        {
+            std::unique_lock<Mutex> lock(mutex);
+            auto me = std::this_thread::get_id();
+#if !defined(__EMSCRIPTEN__)
+            cv.wait(lock, [&] { return stop || firingDepth == 0 || firingThread == me; });
+#endif
+            if (stop || !owner) return;
+            firingThread = me;
+            ++firingDepth;
+            target = owner;
+        }
+        // `owner` stays valid while this thread holds the slot: ~Client on
+        // another thread waits for it (on this thread, the listener destroying
+        // the client is the last thing that touches it).
+        target->responseEvent.notify(r);
+        {
+            std::lock_guard<Mutex> lock(mutex);
+            if (--firingDepth == 0) firingThread = std::thread::id();
+        }
+#if !defined(__EMSCRIPTEN__)
+        cv.notify_all();
+#endif
     }
 
 #if !defined(__EMSCRIPTEN__)
@@ -544,7 +510,7 @@ struct Client::State : std::enable_shared_from_this<Client::State> {
             }
             ResponseEventArgs out;
             if (!perform(job, out)) return;
-            deliver(std::move(out));
+            fire(out);
         }
     }
 #endif
@@ -557,7 +523,7 @@ struct Client::State : std::enable_shared_from_this<Client::State> {
 Client::Client() : state_(std::make_shared<State>()) {
     state_->owner = this;
     // Record the main thread id if nothing has yet (the app runner normally
-    // does): isMainThread() decides where responses fire.
+    // does): Deliver::Main listeners rely on isMainThread().
     getMainThreadId();
     if (const char* env = std::getenv("TYPESAFE_API_KEY")) {
         state_->apiKey = trimmed(env);
@@ -571,14 +537,18 @@ Client::Client(string apiKey) : Client() {
 Client::~Client() {
     auto s = state_;
     {
-        // fireMutex: wait for a listener running on another thread to return,
-        // then no later fire can see the owner.
-        std::lock_guard<RecursiveMutex> guard(s->fireMutex);
-        std::lock_guard<Mutex> lock(s->mutex);
-        s->owner = nullptr;
+        std::unique_lock<Mutex> lock(s->mutex);
         s->stop = true;
         s->jobs.clear();
-        s->pending.clear();
+#if !defined(__EMSCRIPTEN__)
+        s->cv.notify_all();
+        // Wait for a listener running on another thread to return. Not when
+        // this thread holds the slot: then the destructor runs inside one of
+        // this client's own listeners.
+        auto me = std::this_thread::get_id();
+        s->cv.wait(lock, [&] { return s->firingDepth == 0 || s->firingThread == me; });
+#endif
+        s->owner = nullptr;
     }
 #if !defined(__EMSCRIPTEN__)
     s->cv.notify_all();
@@ -670,25 +640,6 @@ bool Client::isAsync() const {
     return state_->async;
 }
 
-Client& Client::setResponseEventAsync(bool async) {
-    auto s = state_;   // a listener fired below may destroy this client
-    std::unique_lock<Mutex> lock(s->mutex);
-    bool wasAsync = s->eventAsync;
-    s->eventAsync = async;
-    // Turning immediate delivery on: fire what is queued for the main thread
-    // now, in order. If a drain is already running (e.g. this is called from a
-    // listener), it keeps going and fires the rest right after.
-    if (async && !wasAsync && !s->pending.empty() && !s->draining) {
-        s->drain(lock);
-    }
-    return *this;
-}
-
-bool Client::isResponseEventAsync() const {
-    std::lock_guard<Mutex> lock(state_->mutex);
-    return state_->eventAsync;
-}
-
 uint64_t Client::request(const Json& state, const Json& questions) {
     if (!questions.is_object()) {
         logError(kLog) << "request(): questions must be a JSON object (name -> question)";
@@ -756,9 +707,9 @@ uint64_t Client::request(const Request& req) {
         return id;
     }
 
-    // Sync: HTTP on this thread, then fire (see deliver()) before returning.
+    // Sync: HTTP and responseEvent on this thread, before returning.
     ResponseEventArgs out;
-    if (s->perform(job, out)) s->deliver(std::move(out));
+    if (s->perform(job, out)) s->fire(out);
     return id;
 #endif
 }

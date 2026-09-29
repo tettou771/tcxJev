@@ -43,8 +43,9 @@ class tcApp : public App {
     EventListener jevListener;
 
     void setup() override {
+        // Deliver::Main: run this listener on the main thread (start of the
+        // next frame), where it may touch nodes and draw state.
         jevListener = jev.responseEvent.listen([](ResponseEventArgs& e) {
-            // Main thread, start of a frame (default)
             if (!e.ok) {
                 logWarning() << "Jev request " << e.requestId << " failed: " << e.error;
                 return;
@@ -52,7 +53,7 @@ class tcApp : public App {
             logNotice() << "urgent:      " << e.answers["urgent"].noul;        // 0..1
             logNotice() << "department:  " << e.answers["department"].choice;  // "billing"
             logNotice() << "frustration: " << e.answers["frustration"].score;  // 0..2
-        });
+        }, Deliver::Main);
 
         jev.request(Request()
             .state("Help! My payouts have been failing for 3 days.")
@@ -132,33 +133,35 @@ unexpected types never throw.
 
 ## Threading and delivery
 
-Two switches decide where the HTTP call runs and where `responseEvent` fires:
+`setAsync()` decides where the HTTP call runs, and `responseEvent` fires on
+that same thread:
 
-| `setAsync` | `setResponseEventAsync` | HTTP call runs | `responseEvent` fires |
-|------------|-------------------------|----------------|------------------------|
-| `true` (default) | `false` (default) | On one worker thread, FIFO, one request at a time | On the **main thread**, in request order, at the start of the next frame (before `update()`) |
-| `true` | `true` | Worker thread | Immediately, on the worker thread |
-| `false` | `false` | Inside `request()`, on the calling thread (blocks, retries included) | Before `request()` returns. Called from a thread other than the main thread, it is queued for the main thread instead |
-| `false` | `true` | Inside `request()`, on the calling thread | Before `request()` returns, on the calling thread |
+| `setAsync` | HTTP call runs | `responseEvent` fires |
+|------------|----------------|------------------------|
+| `true` (default) | On one worker thread, FIFO, one request at a time | On the worker, as each response arrives, in request order |
+| `false` | Inside `request()`, on the calling thread (blocks, retries included) | On the calling thread, before `request()` returns |
+
+Like every `tc::Event` fired off the main thread (network receive events, for
+example), each listener chooses where it runs:
+
+| Listener | Runs |
+|----------|------|
+| `responseEvent.listen(fn, Deliver::Main)` | On the main thread: immediately if the event fires there, otherwise at the start of the next frame (before `update()`), in order. Use this for anything that touches nodes, GPU or draw state. |
+| `responseEvent.listen(fn)` | Right where the event fires (the worker in async mode). No frame latency, but it must not touch the scene. |
 
 - `request()` returns an id right away (async) so you can match responses to
   requests. It returns `0`, and logs why, when the request could not be queued
   (no questions, no API key, web build).
 - The worker starts on the first async request.
-- Main-thread delivery needs the TrussC frame loop (`runApp` /
-  `runHeadlessApp`). In a plain `main()` without it, use
-  `setResponseEventAsync(true)` or sync mode.
-- Switching `setResponseEventAsync(true)` while responses are waiting for
-  the main thread fires all of them immediately, in order, before the call
-  returns; later responses then fire immediately as well.
+- `Deliver::Main` needs the TrussC frame loop (`runApp` / `runHeadlessApp`);
+  in a plain `main()` without it, listen without `Deliver::Main`.
 - Switching `setAsync(false)` does not cancel requests already queued; they
-  finish on the worker and are delivered as usual.
-- Listeners that fire on the worker must not touch the node tree or GPU
-  state; use main-thread delivery (the default) for that.
-- Destroying the `Client` drops queued requests and undelivered responses;
-  nothing fires after the destructor returns. It waits for an HTTP call that
-  is already in progress (at most the timeout). It is safe to destroy the
-  client from inside its own listener.
+  finish on the worker.
+- Destroying the `Client` drops queued requests, and nothing fires after the
+  destructor returns (`Deliver::Main` calls still waiting for a frame are
+  dropped with the event). It waits for an HTTP call already in progress (at
+  most the timeout) and for a listener running on another thread. It is safe
+  to destroy the client from inside its own listener.
 
 ## API key
 

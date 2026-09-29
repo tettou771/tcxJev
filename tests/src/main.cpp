@@ -6,10 +6,10 @@
 // to a scripted fake server, so no API key or network is needed.
 //
 // Covers: request JSON for all question types + the raw form, response parsing,
-// errors and retries, request ids, async FIFO, main-thread delivery vs
-// setResponseEventAsync (incl. the flush-on-switch rule), sync mode, client
-// destruction with work pending, the async decision function, and that the API
-// key never reaches a log line.
+// errors and retries, request ids, async FIFO, which thread responseEvent fires
+// on (plain listeners vs tc::Deliver::Main), sync mode, client destruction with
+// work pending (incl. from inside a listener), the async decision function, and
+// that the API key never reaches a log line.
 // =============================================================================
 
 #include <TrussC.h>
@@ -202,7 +202,7 @@ struct Collector {
     EventListener listener;
     function<void(ResponseEventArgs&)> extra;
 
-    void attach(Client& c) {
+    void attach(Client& c, Deliver deliver = Deliver::Inline) {
         listener = c.responseEvent.listen([this](ResponseEventArgs& e) {
             {
                 lock_guard<mutex> lock(m);
@@ -213,7 +213,7 @@ struct Collector {
             }
             ++count;
             if (extra) extra(e);
-        });
+        }, deliver);
     }
     ResponseEventArgs at(size_t i) {
         lock_guard<mutex> lock(m);
@@ -592,15 +592,20 @@ static void testIds(LogCapture& logs) {
 
 static void testAsyncFifo() {
     FakeServer server;
-    server.hook = [](int i) { sleepMs(1 + (7 - i % 7)); };   // uneven latencies
+    Gate gate;   // holds the first call until every request is queued
+    server.hook = [&](int i) {
+        if (i == 0) gate.wait();
+        sleepMs(1 + (7 - i % 7));   // uneven latencies
+    };
     Client c;
-    c.setApiKey(kKey).setTransport(server.transport()).setResponseEventAsync(true);
+    c.setApiKey(kKey).setTransport(server.transport());
     Collector col;
-    col.attach(c);
+    col.attach(c);   // plain listen(): runs where the event fires
     const int N = 10;
     vector<uint64_t> ids;
     for (int i = 0; i < N; ++i) ids.push_back(c.request(simpleRequest(i)));
-    check("async: request() returns before the HTTP call", server.done < N);
+    check("async: request() returns without waiting for HTTP", server.done == 0 && col.count == 0);
+    gate.release();
     bool all = waitFor([&] { return col.count == N; });
     check("async: every request answered", all);
     check("async: responses in request order", col.ids() == ids);
@@ -613,11 +618,11 @@ static void testAsyncFifo() {
     check("async: HTTP runs off the main thread", offMain);
     bool eventsOnWorker = true;
     for (int i = 0; i < N; ++i) eventsOnWorker &= !col.onMain[i];
-    check("async + eventAsync: fired on the worker, no frame needed", eventsOnWorker);
+    check("async: plain listener runs on the worker, no frame needed", eventsOnWorker);
 }
 
 // ---------------------------------------------------------------------------
-// F. Main-thread delivery (the default) and G. flush on switch
+// F. Deliver::Main listeners: main thread, next frame, in order
 // ---------------------------------------------------------------------------
 
 static void testMainThreadDelivery() {
@@ -626,57 +631,46 @@ static void testMainThreadDelivery() {
     server.hook = [&](int i) { if (i == 3) gate.wait(); };
     Client c;
     c.setApiKey(kKey).setTransport(server.transport());
-    check("defaults: async on, main-thread delivery", c.isAsync() && !c.isResponseEventAsync());
+    check("defaults: async on", c.isAsync());
     Collector col;
-    col.attach(c);
+    col.attach(c, Deliver::Main);
     for (int i = 0; i < 4; ++i) c.request(simpleRequest(i));
-    // The worker is FIFO: once call #4 has started, responses 1..3 are queued.
+    // The worker is FIFO: once call #4 has started, responses 1..3 were fired
+    // and their Deliver::Main calls wait for the main thread.
     bool reached = waitFor([&] { return gate.reached.load(); });
     sleepMs(20);
-    check("main delivery: nothing fires without a frame", reached && col.count == 0);
+    check("Deliver::Main: nothing runs without a frame", reached && col.count == 0);
     drainFrame();
-    check("main delivery: queued responses fire at the frame start", col.count == 3);
-    check("main delivery: in request order", col.ids() == vector<uint64_t>({1, 2, 3}));
+    check("Deliver::Main: queued responses run at the frame start", col.count == 3);
+    check("Deliver::Main: in request order", col.ids() == vector<uint64_t>({1, 2, 3}));
     bool main = true;
     for (int i = 0; i < 3; ++i) main &= col.onMain[i] && col.duringDrain[i];
-    check("main delivery: on the main thread, inside the drain", main);
+    check("Deliver::Main: on the main thread, inside the drain", main);
     gate.release();
     bool fourth = waitFor([&] { return col.count == 4; }, 5000, true);
-    check("main delivery: later response fires on a later frame", fourth && col.onMain[3] && col.duringDrain[3]);
+    check("Deliver::Main: later response runs on a later frame", fourth && col.onMain[3] && col.duringDrain[3]);
 }
 
-static void testFlushOnSwitch() {
+// Listeners of one client can pick different threads.
+static void testDeliverMainMix() {
     FakeServer server;
-    Gate gate;
-    server.hook = [&](int i) { if (i == 3) gate.wait(); };
     Client c;
     c.setApiKey(kKey).setTransport(server.transport());
-    Collector col;
-    col.attach(c);
-    for (int i = 0; i < 4; ++i) c.request(simpleRequest(i));
-    bool reached = waitFor([&] { return gate.reached.load(); });
-    sleepMs(20);
-    check("switch: 3 responses queued for the main thread", reached && col.count == 0);
-
-    c.setResponseEventAsync(true);   // must flush 1..3 right here, in order
-    check("switch to async: queued responses fired before it returns", col.count == 3);
-    check("switch to async: in order", col.ids() == vector<uint64_t>({1, 2, 3}));
-    check("switch to async: flushed on the calling thread (main), not in a drain",
-          col.onMain[0] && col.onMain[2] && !col.duringDrain[0]);
-
-    gate.release();
-    bool fourth = waitFor([&] { return col.count == 4; });   // no drainFrame(): fires immediately
-    check("after switch: next response fires immediately on the worker", fourth && !col.onMain[3]);
-    drainFrame();
-    check("after switch: the stale main-thread drain fires nothing twice", col.count == 4);
-
-    c.setResponseEventAsync(false);
-    c.request(simpleRequest(5));
-    bool sent = waitFor([&] { return server.done == 5; });
-    sleepMs(30);
-    check("switch back: waits for a frame again", sent && col.count == 4);
-    bool fifth = waitFor([&] { return col.count == 5; }, 5000, true);
-    check("switch back: fires on the main thread", fifth && col.onMain[4] && col.duringDrain[4]);
+    atomic<int> inlineCount{0}, mainCount{0};
+    atomic<bool> inlineOnWorker{true}, mainOnMain{true};
+    EventListener a = c.responseEvent.listen([&](ResponseEventArgs&) {
+        if (isMainThread()) inlineOnWorker = false;
+        ++inlineCount;
+    });
+    EventListener b = c.responseEvent.listen([&](ResponseEventArgs& e) {
+        if (!isMainThread() || e.requestId != 1) mainOnMain = false;
+        ++mainCount;
+    }, Deliver::Main);
+    c.request(simpleRequest());
+    bool fired = waitFor([&] { return inlineCount == 1; });
+    check("mix: plain listener fires on the worker", fired && inlineOnWorker && mainCount == 0);
+    bool marshalled = waitFor([&] { return mainCount == 1; }, 5000, true);
+    check("mix: Deliver::Main listener fires on the main thread", marshalled && mainOnMain);
 }
 
 // ---------------------------------------------------------------------------
@@ -688,46 +682,38 @@ static void testSync() {
         FakeServer server;
         Client c;
         useFake(c, server);
-        bool firedBeforeReturn = false;
-        ResponseEventArgs e = roundTrip(c, simpleRequest(), &firedBeforeReturn);
-        check("sync: fires before request() returns", firedBeforeReturn && e.ok && e.requestId == 1);
+        Collector inl, mainCol;
+        inl.attach(c);
+        mainCol.attach(c, Deliver::Main);
+        c.request(simpleRequest());
+        check("sync on main: both listeners ran before request() returned",
+              inl.count == 1 && mainCol.count == 1 && inl.at(0).ok && inl.at(0).requestId == 1);
         check("sync: HTTP ran on the calling thread", server.threads[0] == this_thread::get_id());
     }
     {
-        // From another thread with main-thread delivery: queued for the main thread.
+        // From another thread: plain listeners run there before request()
+        // returns; Deliver::Main listeners wait for the main thread.
         FakeServer server;
         Client c;
         useFake(c, server);
-        Collector col;
-        col.attach(c);
-        int countAtReturn = -1;
-        thread t([&] {
-            c.request(simpleRequest());
-            countAtReturn = col.count;
-        });
-        t.join();
-        check("sync off-main + main delivery: not fired on that thread", countAtReturn == 0 && col.count == 0);
-        drainFrame();
-        check("sync off-main + main delivery: fires on the main thread next frame",
-              col.count == 1 && col.onMain[0]);
-    }
-    {
-        FakeServer server;
-        Client c;
-        useFake(c, server);
-        c.setResponseEventAsync(true);
-        Collector col;
-        col.attach(c);
-        int countAtReturn = -1;
+        Collector inl, mainCol;
+        inl.attach(c);
+        mainCol.attach(c, Deliver::Main);
+        int inlineAtReturn = -1, mainAtReturn = -1;
         thread::id tid;
         thread t([&] {
             tid = this_thread::get_id();
             c.request(simpleRequest());
-            countAtReturn = col.count;
+            inlineAtReturn = inl.count;
+            mainAtReturn = mainCol.count;
         });
         t.join();
-        check("sync off-main + eventAsync: fired on the calling thread before return",
-              countAtReturn == 1 && col.threads[0] == tid);
+        check("sync off-main: plain listener ran on the calling thread before return",
+              inlineAtReturn == 1 && inl.threads[0] == tid);
+        check("sync off-main: Deliver::Main listener not run on that thread", mainAtReturn == 0);
+        drainFrame();
+        check("sync off-main: Deliver::Main listener runs on the main thread next frame",
+              mainCol.count == 1 && mainCol.onMain[0]);
     }
 }
 
@@ -762,14 +748,14 @@ static void testDestruction() {
         {
             Client c;
             c.setApiKey(kKey).setTransport(server.transport());
-            col.attach(c);
+            col.attach(c, Deliver::Main);
             c.request(simpleRequest(1));
             c.request(simpleRequest(2));
             waitFor([&] { return server.done == 2; });
-            sleepMs(50);   // responses now wait for the main thread
+            sleepMs(50);   // both fired; the Deliver::Main calls wait for a frame
         }
         drainFrame();
-        check("destroy: responses queued for the main thread never fire", col.count == 0);
+        check("destroy: Deliver::Main calls still queued never run", col.count == 0);
     }
     {
         // Destroyed by its own listener during a main-thread drain.
@@ -777,7 +763,7 @@ static void testDestruction() {
         auto c = make_unique<Client>();
         c->setApiKey(kKey).setTransport(server.transport());
         Collector col;
-        col.attach(*c);
+        col.attach(*c, Deliver::Main);
         col.extra = [&](ResponseEventArgs&) { c.reset(); };
         for (int i = 0; i < 3; ++i) c->request(simpleRequest(i));
         waitFor([&] { return server.done == 3; });
@@ -794,7 +780,7 @@ static void testDestruction() {
         Gate gate;
         server.hook = [&](int i) { if (i == 0) gate.wait(); };
         auto c = make_unique<Client>();
-        c->setApiKey(kKey).setTransport(server.transport()).setResponseEventAsync(true);
+        c->setApiKey(kKey).setTransport(server.transport());
         Collector col;
         col.attach(*c);
         atomic<bool> destroyed{false};
@@ -808,6 +794,44 @@ static void testDestruction() {
         sleepMs(100);
         drainFrame();
         check("destroy from a worker listener: no crash, rest dropped", gone && col.count == 1);
+    }
+    {
+        // A sync listener destroys the client while the worker waits to fire
+        // its own response: the destructor must not deadlock joining it, and
+        // the worker's response must not fire. Runs on a helper thread so a
+        // regression fails the test instead of hanging CI.
+        FakeServer server;
+        Gate gate;
+        server.hook = [&](int i) { if (i == 0) gate.wait(); };
+        atomic<int> firedA{0}, firedB{0};
+        atomic<bool> finished{false};
+        thread t([&] {
+            auto c = make_unique<Client>();
+            c->setApiKey(kKey).setTransport(server.transport()).setRetryDelay(0.001f, 0.004f);
+            EventListener l = c->responseEvent.listen([&](ResponseEventArgs& e) {
+                if (e.requestId == 1) { ++firedA; return; }
+                ++firedB;
+                gate.release();                               // let the worker's call finish
+                waitFor([&] { return server.done == 2; });
+                sleepMs(50);                                  // worker now waits to fire
+                c.reset();
+            });
+            c->request(simpleRequest(1));                     // async, held at the gate
+            waitFor([&] { return gate.reached.load(); });     // the worker owns call #0
+            c->setAsync(false);
+            c->request(simpleRequest(2));                     // sync, fires on this thread
+            finished = true;
+        });
+        bool done = waitFor([&] { return finished.load(); }, 10000);
+        check("destroy from a sync listener while the worker waits to fire: no deadlock", done);
+        if (!done) {
+            std::printf("\nFAILED  (deadlock; aborting)\n");
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        t.join();
+        check("destroy from a sync listener: the waiting worker response never fires",
+              firedB == 1 && firedA == 0);
     }
     {
         Client unused;   // never started a worker
@@ -858,7 +882,7 @@ struct DeliveryApp : App {
             ++g_appFired;
             g_appFiredOnMain = isMainThread() && e.ok;
             firedAtFrame = frames;
-        });
+        }, Deliver::Main);
         jev.request(simpleRequest());
     }
     void update() override {
@@ -894,7 +918,7 @@ int main() {
     testIds(logs);
     testAsyncFifo();
     testMainThreadDelivery();
-    testFlushOnSwitch();
+    testDeliverMainMix();
     testSync();
     testDestruction();
     testAsyncDecision(logs);

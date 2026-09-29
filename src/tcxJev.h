@@ -14,14 +14,16 @@
 //   tc::EventListener listener = jev.responseEvent.listen(
 //       [](tcx::jev::ResponseEventArgs& e) {
 //           if (e.ok) tc::logNotice() << "urgent: " << e.answers["urgent"].noul;
-//       });
+//       }, tc::Deliver::Main);   // main thread, start of the next frame
 //   jev.request(tcx::jev::Request()
 //       .state("Help! My payouts have been failing for 3 days.")
 //       .noul("urgent", "Does this convey urgency?"));
 //
-// Threading (defaults): requests run one at a time on a worker thread, and
-// responseEvent fires on the main thread at the start of the next frame.
-// setAsync() / setResponseEventAsync() change that; see README.md.
+// Threading: requests run one at a time on a worker thread (setAsync(false):
+// on the calling thread), and responseEvent fires on that thread. As with any
+// tc::Event, each listener picks where it runs: tc::Deliver::Main for the main
+// thread (anything touching nodes / GPU), plain listen() for right away on the
+// worker. See README.md.
 // =============================================================================
 
 #include <TrussC.h>
@@ -154,9 +156,10 @@ public:
     // API key from the TYPESAFE_API_KEY environment variable, if set.
     Client();
     explicit Client(std::string apiKey);
-    // Stops the worker: pending requests are dropped and nothing fires after
-    // this returns. Waits for an HTTP call already in progress (bounded by
-    // setTimeout()).
+    // Stops the worker: queued requests are dropped and nothing fires after
+    // this returns (Deliver::Main calls still waiting for the main thread die
+    // with responseEvent). Waits for an HTTP call already in progress (bounded
+    // by setTimeout()) and for a listener running on another thread.
     ~Client();
 
     Client(const Client&) = delete;
@@ -186,8 +189,11 @@ public:
     // Raw form: `questions` is the API's name -> question object map.
     uint64_t request(const tc::Json& state, const tc::Json& questions);
 
-    // Fired once per accepted request. Thread and timing: see setAsync() and
-    // setResponseEventAsync().
+    // Fired once per accepted request, in request order, on the thread that
+    // ran the HTTP call: the worker (async) or the caller of request() (sync).
+    // Listen with tc::Deliver::Main to run a listener on the main thread
+    // instead (at the start of the next frame, before update(); needs the
+    // TrussC frame loop).
     tc::Event<ResponseEventArgs> responseEvent;
 
     // true (default where threads exist): requests run on one worker thread,
@@ -198,13 +204,6 @@ public:
     Client& setAsync(bool async);
     bool isAsync() const;
     static bool isAsyncSupported();
-
-    // false (default): responses fire on the main thread, in request order, at
-    // the start of the next frame (before update). Needs the TrussC frame loop.
-    // true: responses fire right away on the thread that produced them (the
-    // worker). Switching to true first fires every queued response, in order.
-    Client& setResponseEventAsync(bool async);
-    bool isResponseEventAsync() const;
 
     // Replace the HTTP call, for tests or custom networking (a proxy, another
     // HTTP stack). It runs on the worker thread (async) or the calling thread
