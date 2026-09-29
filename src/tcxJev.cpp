@@ -138,10 +138,12 @@ string textOf(const Json& j) {
     return j.is_string() ? j.get<string>() : j.dump(-1, ' ', false, Json::error_handler_t::replace);
 }
 
-// Best-effort message from an error body. The API documents only "a JSON body
-// describing what went wrong", so accept the usual shapes: {"error": "..."},
-// {"error": {"message": "..."}}, {"message": "..."}, {"detail": "..."} and a
-// validation list {"detail": [{"loc": [...], "msg": "..."}]}.
+// Message from an error body. The live API always answers with a top-level
+// "detail" in one of three shapes:
+//   {"detail": "Choice question must have at least one choice: c"}      (400)
+//   {"detail": {"error_type": "authentication_error", "message": "..."}} (400, 401)
+//   {"detail": [{"loc": ["body", "state"], "msg": "Field required"}]}   (422)
+// {"error": ...} / {"message": ...} are accepted too, in case a proxy answers.
 string errorMessageFromBody(const Json& j) {
     if (j.is_string()) return clipped(j.get<string>());
     if (!j.is_object()) return clipped(textOf(j));
@@ -160,6 +162,13 @@ string errorMessageFromBody(const Json& j) {
     auto detail = j.find("detail");
     if (detail != j.end()) {
         if (detail->is_string()) return clipped(detail->get<string>());
+        if (detail->is_object()) {
+            string msg = stringOr(*detail, "message");
+            if (!msg.empty()) {
+                string type = stringOr(*detail, "error_type");
+                return clipped(type.empty() ? msg : type + ": " + msg);
+            }
+        }
         if (detail->is_array()) {
             string out;
             for (const auto& d : *detail) {

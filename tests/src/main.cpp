@@ -454,6 +454,51 @@ static void testErrors() {
                   e.error.find("body.model: Unknown model") != string::npos);
     }
     {
+        // Error bodies recorded from the live API (jev-1.13.0). The top level is
+        // always "detail": a string, {error_type, message}, or a list.
+        struct Case {
+            const char* name;
+            int status;
+            string body;
+            string want;
+        };
+        const vector<Case> cases = {
+            {"real 401: detail object -> error_type: message", 401,
+             R"({"detail":{"error_type":"authentication_error","message":"Cannot authenticate with the server. Please check your API key and try again."}})",
+             "HTTP 401 (Unauthorized: check the API key): authentication_error: Cannot authenticate with the server. "
+             "Please check your API key and try again."},
+            {"real 400: empty choice (detail string)", 400,
+             R"({"detail":"Choice question must have at least one choice: c"})",
+             "HTTP 400 (Bad Request): Choice question must have at least one choice: c"},
+            {"real 400: unknown question type (detail object)", 400,
+             R"({"detail":{"error_type":"api_usage_error","message":"Invalid request."}})",
+             "HTTP 400 (Bad Request): api_usage_error: Invalid request."},
+            {"real 400: noul without criteria or instructions", 400,
+             R"({"detail":"Noul question must have criteria or instructions: n"})",
+             "HTTP 400 (Bad Request): Noul question must have criteria or instructions: n"},
+            {"real 400: unknown model (detail object)", 400,
+             R"({"detail":{"error_type":"api_usage_error","message":"Unknown model: jev-does-not-exist"}})",
+             "HTTP 400 (Bad Request): api_usage_error: Unknown model: jev-does-not-exist"},
+            {"real 400: too many score levels", 400,
+             R"({"detail":"Too many score levels. Must have at most 10 levels."})",
+             "HTTP 400 (Bad Request): Too many score levels. Must have at most 10 levels."},
+            {"real 422: missing state (detail list, input not echoed)", 422,
+             R"({"detail":[{"input":{"model":"jev-latest","questions":{"q":{"type":"noul","instructions":"ECHOED-INPUT"}}},"loc":["body","state"],"msg":"Field required","type":"missing"}]})",
+             "HTTP 422 (Unprocessable Entity: the request failed validation): body.state: Field required"},
+        };
+        for (const auto& k : cases) {
+            FakeServer server;
+            Client c;
+            useFake(c, server);
+            server.push(reply(k.status, k.body));
+            ResponseEventArgs e = roundTrip(c, simpleRequest());
+            bool ok = server.calls == 1 && !e.ok && e.statusCode == k.status && e.error == k.want &&
+                      e.raw.contains("detail");
+            if (!ok) std::printf("  got: %s\n", e.error.c_str());
+            check(k.name, ok);
+        }
+    }
+    {
         FakeServer server;
         Client c;
         useFake(c, server);
