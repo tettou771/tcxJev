@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']   # every branch: a push never silently skips CI. Narrow to [main] if CI is too heavy for this addon.
+    tags: ['v*']
+  pull_request:
+    branches: [main]   # mainly to cover fork PRs into main (your own branches already run via push)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  # Builds this addon + its example-*/ projects on macOS / Windows / Linux.
+  # Addon name and platforms (addon.json) are auto-detected, so this file is
+  # copy-safe: rename the addon and CI keeps working with no edits here. Add a
+  # tests/ directory to opt into behavioral tests (see the README).
+  build:
+    uses: TrussC-org/ci-actions/.github/workflows/build-addon.yml@v1
