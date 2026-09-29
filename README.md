@@ -29,6 +29,10 @@ the tcxCurl dependency). tcxCurl ships with TrussC; on Linux it needs
 
 You also need a TypeSafe API key (see [API key](#api-key)).
 
+[`example-basic/`](example-basic) sends one request with two Nouls, a Choice
+and a Score about a support message and draws the answers as bars; it reads
+the key from `bin/data/secrets.json`.
+
 ## Quick start
 
 ```cpp
@@ -70,7 +74,10 @@ class tcApp : public App {
 ```
 
 One request can carry many questions; they are all evaluated against the same
-state in one call, which is much cheaper and faster than one request each.
+state in one call. Batching the questions about one state into one request is
+about 10x cheaper and faster than one request per question (TypeSafe's
+[parallel questions](https://docs.typesafe.ai/cookbooks/parallel_questions)
+cookbook), and it matters here because the worker sends one request at a time.
 
 ## Building a request
 
@@ -80,7 +87,7 @@ state in one call, which is much cheaper and faster than one request each.
 | `noul(name, instructions)` | A yes/no question. |
 | `noul(name, instructions, whenTrue, whenFalse)` | Same, with descriptions of what yes / no mean (`criteria.true` / `criteria.false`; pass `nullptr` for one side to leave it out). |
 | `choice(name, instructions, options)` | Pick one option. `options` is an object option -> description (`nullptr` for none) or an array of names: `Json::array({"red", "green", "blue"})`. At most 255 options. |
-| `score(name, instructions, levels)` | Rate against ordered levels, lowest first (2 to 10). A `vector<string>` works too. |
+| `score(name, instructions, levels)` | Rate against ordered levels, lowest first (2 to 10; the API also accepts a single level, but tcxJev warns about it). A `vector<string>` works too. |
 | `question(name, json)` | Any question object, sent as-is (escape hatch for new API fields). |
 | `model(name)` | Model for this request only. |
 
@@ -177,16 +184,21 @@ example), each listener chooses where it runs:
   `.gitignore`) and load it in `setup()`:
 
   ```cpp
-  Json secrets = loadJson("secrets.json");   // {"typesafe_api_key": "..."}
-  if (secrets.contains("typesafe_api_key")) jev.setApiKey(secrets["typesafe_api_key"].get<string>());
+  if (fileExists(getDataPath("secrets.json"))) {   // {"typesafe_api_key": "..."}
+      Json secrets = loadJson("secrets.json");
+      if (secrets.contains("typesafe_api_key") && secrets["typesafe_api_key"].is_string()) {
+          jev.setApiKey(secrets["typesafe_api_key"].get<string>());
+      }
+  }
   ```
 
 ## Errors and retries
 
 | Status | Meaning | Retried |
 |--------|---------|---------|
+| 400 | The request was rejected: an invalid question or model (e.g. a Choice with no options, more than 10 Score levels, an unknown model); `error` carries the reason | no |
 | 401 | Missing or invalid API key | no |
-| 422 | The request failed validation; `error` carries the details | no |
+| 422 | The request body failed schema validation (e.g. a missing field such as `state`) | no |
 | 429 | Rate limited | yes |
 | 529 | Overloaded | yes |
 | 408, other 5xx | Timeout / server error | yes |
