@@ -1,0 +1,27 @@
+{
+  "buildPresets": [
+    {
+      "configurePreset": "linux",
+      "jobs": 4,
+      "name": "linux"
+    }
+  ],
+  "configurePresets": [
+    {
+      "binaryDir": "${sourceDir}/build-linux",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "TRUSSC_DIR": "/home/toru/TrussC-dev/TrussC/core"
+      },
+      "displayName": "Linux",
+      "generator": "Unix Makefiles",
+      "name": "linux"
+    }
+  ],
+  "vendor": {
+    "trussc": {
+      "ide": "cmake"
+    }
+  },
+  "version": 6
+}

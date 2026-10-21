@@ -33,10 +33,52 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <optional>
+#include <vector>
 
 namespace tcx::jev {
 
-enum class QuestionType { Noul, Choice, Score, Unknown };
+namespace detail { struct ImageBudget; struct Snapshot; struct VisionAccess; }
+
+enum class ImageEncoding { Auto, PNG, JPEG };
+enum class AlphaMode { Straight, Premultiplied };
+enum class ImageColorSpace { SRGB, Linear };
+enum class ImageOrigin { TopLeft, BottomLeft };
+
+struct ImageOptions {
+    ImageEncoding encoding = ImageEncoding::Auto;
+    int jpegQuality = 90;
+    AlphaMode alpha = AlphaMode::Straight;
+    ImageColorSpace colorSpace = ImageColorSpace::SRGB;
+    ImageOrigin origin = ImageOrigin::TopLeft;
+    tc::Color jpegBackground{1.0f, 1.0f, 1.0f, 1.0f}; // Opaque sRGB matte.
+    int maxSide = 0; // Opt-in downscale; 0 keeps dimensions. Never upscales.
+};
+
+struct ImageLimits {
+    size_t snapshotBytes = 64 * 1024 * 1024;
+    size_t pendingImageBytes = 32 * 1024 * 1024;
+};
+
+// A copyable identity only; keeping an Asset does not keep its pixels alive.
+class Asset {
+public:
+    explicit operator bool() const { return !ref_.empty(); }
+    std::string ref() const { return ref_; }
+private:
+    Asset() = default;
+    std::string ref_;
+    friend class Request;
+};
+void to_json(tc::Json& out, const Asset& asset);
+
+struct BoxResult {
+    tc::Rect rect; // Normalized, top-left origin; x rightward, y downward.
+    std::optional<double> confidence;
+    tc::Rect toPixels(float width, float height) const;
+};
+
+enum class QuestionType { Noul, Choice, Score, Unknown, Box };
 
 // One answer per question, stored under the question's name.
 // Fields a response does not carry keep their defaults.
@@ -49,6 +91,7 @@ struct Answer {
     std::map<std::string, double> probabilities; // Choice: option -> p, Score: "0".."n" -> p
     std::map<int, std::string> legend;           // Score: level index -> description
                                                  // (a structured level is kept as its JSON text)
+    std::optional<BoxResult> box; // Box only; confidence stays optional here.
 };
 
 // Payload of Client::responseEvent. Fired once per request that request()
@@ -84,6 +127,13 @@ struct ResponseEventArgs {
 // structured JSON (object / array), as the API allows.
 class Request {
 public:
+    // Requires Client::imageRequest(). Snapshots CPU U8 pixels now, applying
+    // opt-in maxSide downscaling; encodes at submission. Prevent concurrent
+    // source mutation during this snapshot.
+    Asset addImage(const tc::Pixels& pixels, ImageOptions options = {});
+    Asset addImage(const tc::Image& image, ImageOptions options = {});
+    Request& box(const std::string& name, const tc::Json& instructions);
+
     // The content to evaluate: a string, or a JSON object / array.
     Request& state(const tc::Json& s);
 
@@ -119,10 +169,17 @@ public:
     const tc::Json& getQuestions() const { return questions_; }
     const std::string& getModel() const { return model_; }
 
-    // The request body as sent to POST /v1/systemone.
+    // Logical request JSON. With images this includes a multipart manifest,
+    // not a self-contained upload; Client constructs the actual body.
     tc::Json toJson(const std::string& defaultModel = "jev-latest") const;
 
 private:
+    friend class Client;
+    friend struct detail::VisionAccess;
+    std::shared_ptr<detail::ImageBudget> imageBudget_;
+    std::vector<std::shared_ptr<const detail::Snapshot>> images_;
+    bool imageOptIn_ = false;
+    std::string imageError_; // Sticky registration failure.
     tc::Json state_;                          // null until state() is called
     tc::Json questions_ = tc::Json::object();
     std::string model_;                       // empty = the client's model
@@ -134,6 +191,8 @@ struct TransportRequest {
     std::string apiKey;          // send as "Authorization: Bearer <apiKey>"; never log it
     std::string body;            // JSON, send with "Content-Type: application/json"
     float timeoutSeconds = 30;
+    std::string contentType = "application/json";
+    std::map<std::string, std::string> headers;
 };
 
 // What a Transport returns.
@@ -166,6 +225,9 @@ public:
 
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
+
+    Request imageRequest(); // Per-request opt-in, bound to this Client.
+    Client& setImageLimits(ImageLimits limits); // Zero blocks new admissions.
 
     Client& setApiKey(std::string apiKey);   // never logged
     bool hasApiKey() const;

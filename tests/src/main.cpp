@@ -1301,6 +1301,10 @@ static void testHeadlessApp() {
 
 // ---------------------------------------------------------------------------
 
+void testVision(void (*check)(const std::string&, bool));
+
+void testAdmissionReentrancy(void (*check)(const std::string&, bool));
+
 int main() {
     getMainThreadId();                       // record the main thread (no app runner yet)
     setEnv("TYPESAFE_API_KEY", nullptr);     // tests must not depend on the environment
@@ -1319,6 +1323,8 @@ int main() {
     testSync();
     testDestruction();
     testAsyncDecision(logs);
+    testVision(check);
+    testAdmissionReentrancy(check);
     testHeadlessApp();
 
     check("no log line ever contains an API key", !logs.anyContains(kKey) && !logs.anyContains(kEnvKey));

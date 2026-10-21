@@ -95,6 +95,20 @@ void tcApp::setup() {
     // listener on the main thread instead (start of the next frame), so it can
     // safely change what draw() shows.
     jevListener = jev.responseEvent.listen([this](ResponseEventArgs& e) {
+        if (e.requestId == imageRequestId) {
+            imageStatus = e.ok ? "Image answered" : e.error;
+            if (e.ok) {
+                auto found = e.answers.find("mug");
+                if (found != e.answers.end() && found->second.box) {
+                    const auto rect = found->second.box->toPixels(photo.getWidth(), photo.getHeight());
+                    imageStatus = "Mug pixels: " + toString(rect.x, 1) + ", " + toString(rect.y, 1) +
+                        "  " + toString(rect.width, 1) + " x " + toString(rect.height, 1);
+                } else if (e.answers.count("visible")) {
+                    imageStatus = "Mug probability: " + toString(e.answers.at("visible").noul, 2);
+                }
+            }
+            return;
+        }
         for (auto& slot : slots) {
             if (slot.requestId != e.requestId) continue;
             slot.waiting = false;
@@ -135,12 +149,32 @@ void tcApp::ask(int index) {
     slot.sentAt = getElapsedTimef();
 }
 
+// Optional image upload: triggered only by I/B. Check photo.png's contents
+// before pressing either key; pixels are uploaded to TypeSafe's external API.
+void tcApp::askImage(bool locate) {
+    if (!jev.hasApiKey()) return;
+    if (!fileExists(getDataPath("photo.png"))) {
+        imageStatus = "Add an upright 280..1568 px photo.png to bin/data first";
+        return;
+    }
+    if (!photo.load("photo.png")) { imageStatus = "Could not load photo.png"; return; }
+    auto req = jev.imageRequest();
+    auto img = req.addImage(photo);
+    req.model("jev-1.14.0").state(Json{{"photo", img}})
+        .noul("visible", "Is there a mug in `photo`?");
+    if (locate) req.box("mug", "The mug nearest the sink in `photo`");
+    imageRequestId = jev.request(req);
+    imageStatus = imageRequestId ? "Uploading photo.png..." : "Image request was not accepted";
+}
+
 void tcApp::select(int index) {
     current = index;
     if (slots[current].requestId == 0 && jev.hasApiKey()) ask(current);
 }
 
 void tcApp::keyPressed(int key) {
+    if (key == 'i' || key == 'I') { askImage(false); return; }
+    if (key == 'b' || key == 'B') { askImage(true); return; }
     int n = (int)messages.size();
     if (key == KEY_RIGHT || key == KEY_DOWN) select((current + 1) % n);
     else if (key == KEY_LEFT || key == KEY_UP) select((current + n - 1) % n);
@@ -210,6 +244,9 @@ void tcApp::draw() {
     drawBitmapString("tcxJev: one request, four typed answers", x, 24);
     setColor(0.55f);
     drawBitmapString("LEFT / RIGHT or 1-" + toString(messages.size()) + ": message    SPACE: ask again", x, 44);
+
+    drawBitmapString("I: upload photo.png (presence)   B: upload photo.png (Box)", x, 62);
+    if (!imageStatus.empty()) drawBitmapString(imageStatus, x, getWindowHeight() - 50);
 
     // The message, sent as the state
     float y = 84;
