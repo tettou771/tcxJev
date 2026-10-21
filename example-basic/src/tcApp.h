@@ -25,6 +25,10 @@ private:
     };
 
     void ask(int index);
+    void askImage(bool locate);
+    Image photo;
+    uint64_t imageRequestId = 0;
+    string imageStatus;
     void select(int index);
     float drawNoul(const string& label, const Answer& a, float x, float y);
     float drawDistribution(const string& label, const Answer& a, float x, float y);

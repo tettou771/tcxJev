@@ -1,8 +1,10 @@
 #include "tcxJev.h"
+#include "tcxJevVisionInternal.h"
 
 #include <tcxCurl.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -84,6 +86,7 @@ const char* statusText(int code) {
         case 404: return "Not Found";
         case 408: return "Request Timeout";
         case 413: return "Payload Too Large";
+        case 415: return "Unsupported Media Type";
         case 422: return "Unprocessable Entity: the request failed validation";
         case 429: return "Too Many Requests: rate limited";
         case 500: return "Internal Server Error";
@@ -231,10 +234,11 @@ Answer parseAnswer(const Json& a) {
     auto legend = a.find("legend");
     if (legend != a.end() && legend->is_object()) {
         for (const auto& [key, level] : legend->items()) {
-            char* end = nullptr;
-            long index = std::strtol(key.c_str(), &end, 10);
-            if (key.empty() || end == nullptr || *end != '\0') continue;   // not an integer key
-            out.legend[static_cast<int>(index)] = textOf(level);
+            // Wire keys use ASCII integers, independent of the host's C locale.
+            int index = 0;
+            const auto result = std::from_chars(key.data(), key.data() + key.size(), index);
+            if (result.ec != std::errc{} || result.ptr != key.data() + key.size()) continue;
+            out.legend[index] = textOf(level);
         }
     }
     return out;
@@ -273,7 +277,13 @@ ResponseEventArgs parseResponse(uint64_t id, const TransportResponse& res) {
     out.ok = true;
     out.model = stringOr(j, "model");
     for (const auto& [name, a] : answers->items()) {
-        out.answers[name] = parseAnswer(a);
+        auto answer = parseAnswer(a);
+        if (!detail::parseBoxAnswer(a, answer, out.error)) {
+            out.ok = false;
+            out.answers.clear();
+            return out;
+        }
+        out.answers[name] = std::move(answer);
     }
     auto usage = j.find("usage");
     if (usage != j.end() && usage->is_object()) {
@@ -289,7 +299,8 @@ TransportResponse curlTransport(const TransportRequest& req) {
     tcx::curl::HttpClient http;
     http.setTimeout((std::max)(1L, static_cast<long>(std::ceil(req.timeoutSeconds))));
     if (!req.apiKey.empty()) http.setBearerToken(req.apiKey);
-    auto res = http.postRaw(req.url, req.body, "application/json");
+    for (const auto& [name, value] : req.headers) http.addHeader(name, value);
+    auto res = http.postRaw(req.url, req.body, req.contentType);
     TransportResponse out;
     out.statusCode = res.statusCode;
     out.body = std::move(res.body);
@@ -305,6 +316,14 @@ struct Job {
     float retryInitial = 0.5f;
     float retryMax = 8.0f;
     Transport transport;   // empty = curlTransport
+    bool vision = false;
+    Request visionRequest;
+    string defaultModel;
+    std::shared_ptr<detail::PendingImages> imageCharge;
+    void releaseImages() {
+        visionRequest = Request();
+        imageCharge.reset();
+    }
 };
 
 TransportResponse callTransport(const Job& job) {
@@ -406,6 +425,7 @@ Json Request::toJson(const string& defaultModel) const {
     body["state"] = state_;
     body["model"] = model_.empty() ? defaultModel : model_;
     body["questions"] = questions_;
+    detail::addManifest(body, *this);
     return body;
 }
 
@@ -423,6 +443,7 @@ struct Client::State : std::enable_shared_from_this<Client::State> {
     std::condition_variable cv;   // new job, stop, slot freed, fire slot released
     vector<std::thread> workers;  // started on demand, never more than maxConcurrent
 #endif
+    std::shared_ptr<detail::ImageBudget> imageBudget = std::make_shared<detail::ImageBudget>();
     Client* owner = nullptr;      // cleared by ~Client while no other thread fires
 
     // Settings
@@ -461,7 +482,15 @@ struct Client::State : std::enable_shared_from_this<Client::State> {
 
     // Runs the HTTP call with retries. Returns false (and fills nothing) when
     // the client was destroyed during a wait.
-    bool perform(const Job& job, ResponseEventArgs& out) {
+    bool perform(Job& job, ResponseEventArgs& out) {
+        if (job.vision) {
+            auto error = detail::prepareVision(job.visionRequest, job.defaultModel, job.http);
+            if (!error.empty()) {
+                out.requestId = job.id;
+                out.error = error;
+                return true; // Local status 0 never enters the network retry loop.
+            }
+        }
         TransportResponse res;
         int retries = 0, rateLimitRetries = 0;
         for (;;) {
@@ -621,6 +650,7 @@ struct Client::State : std::enable_shared_from_this<Client::State> {
             bool finished = perform(job, out);
             // The slot is held until the event fired, so with maxConcurrent 1
             // the next request can't overtake this one.
+            job.releaseImages();
             if (finished) fire(out);
             {
                 std::lock_guard<Mutex> lock(mutex);
@@ -657,6 +687,10 @@ Client::~Client() {
     {
         std::unique_lock<Mutex> lock(s->mutex);
         s->stop = true;
+        {
+            std::lock_guard<std::mutex> imageLock(s->imageBudget->mutex);
+            s->imageBudget->open = false;
+        }
         s->jobs.clear();
 #if !defined(__EMSCRIPTEN__)
         s->cv.notify_all();
@@ -684,6 +718,19 @@ Client::~Client() {
         }
     }
 #endif
+}
+
+Request Client::imageRequest() {
+    Request req;
+    req.imageBudget_ = state_->imageBudget;
+    req.imageOptIn_ = true;
+    return req;
+}
+
+Client& Client::setImageLimits(ImageLimits limits) {
+    std::lock_guard<std::mutex> lock(state_->imageBudget->mutex);
+    state_->imageBudget->limits = limits;
+    return *this;
 }
 
 Client& Client::setApiKey(string apiKey) {
@@ -819,26 +866,76 @@ uint64_t Client::request(const Request& req) {
     // Build the body outside the lock: the state can be large.
     Job job;
     job.http.url = kEndpoint;
-    job.http.body = req.toJson(model).dump(-1, ' ', false, Json::error_handler_t::replace);
+    job.vision = req.imageOptIn_ || detail::hasBox(req.getQuestions());
+    if (req.imageBudget_ && req.imageBudget_ != s->imageBudget) {
+        logError(kLog) << "image admission: request belongs to another Client";
+        return 0;
+    }
+    if (job.vision) job.defaultModel = model;
+    else job.http.body = req.toJson(model).dump(-1, ' ', false, Json::error_handler_t::replace);
 
+    // Count immutable snapshots without holding a Client lock: even error logs
+    // synchronously invoke application listeners, which may re-enter this Client.
+    size_t bytes = 0;
+    if (job.vision) {
+        for (const auto& image : req.images_) {
+            // Bound (abi): each distinct registered payload contributes once per job.
+            if (!detail::checkedAdd(bytes, image->bytes.size(), (std::numeric_limits<size_t>::max)())) {
+                logError(kLog) << "image admission: image byte count overflow";
+                return 0;
+            }
+        }
+    }
     bool async;
     string workerError;
     {
-        std::lock_guard<Mutex> lock(s->mutex);
-        job.id = s->nextId++;
-        job.http.apiKey = s->apiKey;
-        job.http.timeoutSeconds = s->timeoutSeconds;
-        job.maxRetries = s->maxRetries;
-        job.retryInitial = s->retryInitial;
-        job.retryMax = s->retryMax;
-        job.transport = s->transport;
-        async = s->async;
-        if (async) {
-            s->jobs.push_back(job);
-            workerError = s->ensureWorkers();
-            if (!workerError.empty()) s->jobs.pop_back();
+        std::unique_lock<Mutex> lock(s->mutex);
+        if (s->stop) return 0;
+        if (job.vision) {
+            auto charge = std::make_shared<detail::PendingImages>();
+            charge->budget = s->imageBudget;
+            bool rejected;
+            size_t retained, limit;
+            {
+                std::lock_guard<std::mutex> imageLock(s->imageBudget->mutex);
+                limit = s->imageBudget->limits.pendingImageBytes;
+                // Bound (admission): reserve queued/active snapshot bytes (after opt-in resize) before job retention.
+                rejected = !s->imageBudget->open || !detail::checkedAdd(s->imageBudget->pending, bytes, limit);
+                retained = s->imageBudget->pending;
+                if (!rejected) charge->charged = bytes;
+            }
+            if (rejected) {
+                lock.unlock();
+                logError(kLog) << "image admission: pending image byte budget exhausted: requested " << bytes
+                    << "; retained " << retained << "; limit " << limit;
+                return 0;
+            }
+            job.imageCharge = std::move(charge);
         }
-        if (workerError.empty()) ++s->pending;
+        bool enqueued = false;
+        try {
+            if (job.vision) job.visionRequest = req;
+            job.id = s->nextId++;
+            job.http.apiKey = s->apiKey;
+            job.http.timeoutSeconds = s->timeoutSeconds;
+            job.maxRetries = s->maxRetries;
+            job.retryInitial = s->retryInitial;
+            job.retryMax = s->retryMax;
+            job.transport = s->transport;
+            async = s->async;
+            if (async) {
+                s->jobs.push_back(std::move(job));
+                enqueued = true;
+                workerError = s->ensureWorkers();
+                // Keep id locally even though the rest of the job moved to the queue.
+                job.id = s->jobs.back().id;
+                if (!workerError.empty()) { s->jobs.pop_back(); enqueued = false; }
+            }
+            if (workerError.empty()) ++s->pending;
+        } catch (...) {
+            if (enqueued) s->jobs.pop_back();
+            workerError = "could not retain/enqueue request";
+        }
     }
     if (!workerError.empty()) {
         logError(kLog) << "request(): could not start a worker thread: " << workerError;
@@ -852,7 +949,9 @@ uint64_t Client::request(const Request& req) {
 
     // Sync: HTTP and responseEvent on this thread, before returning.
     ResponseEventArgs out;
-    if (s->perform(job, out)) s->fire(out);
+    bool finished = s->perform(job, out);
+    job.releaseImages();
+    if (finished) s->fire(out);
     return id;
 #endif
 }
@@ -881,6 +980,7 @@ size_t Client::cancelAll() {
         std::lock_guard<Mutex> lock(s->mutex);
         dropped.swap(s->jobs);
     }
+    for (auto& job : dropped) job.releaseImages();
     for (const auto& job : dropped) s->fireCancelled(job.id);
     return dropped.size();
 }

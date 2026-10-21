@@ -8,7 +8,8 @@ piece of text, or JSON such as a chat log or a record) and a set of named,
 typed **questions**; it returns one calibrated answer per question: a
 **Noul** gives the probability that a yes/no question is yes, a **Choice**
 picks one option from a set you define (with a probability for every option),
-and a **Score** places the state on an ordered rubric of levels. The answers
+a **Score** places the state on an ordered rubric of levels, and a **Box** locates
+a target in an image. The answers
 are numbers your code can branch on, not generated text. See the
 [TypeSafe docs](https://docs.typesafe.ai) (API reference:
 [docs.typesafe.ai/api](https://docs.typesafe.ai/api)).
@@ -30,7 +31,9 @@ the tcxCurl dependency). tcxCurl ships with TrussC; on Linux it needs
 You also need a TypeSafe API key (see [API key](#api-key)).
 
 [`example-basic/`](example-basic) sends one request with two Nouls, a Choice
-and a Score about a support message and draws the answers as bars; it reads
+and a Score about a support message and draws the answers as bars. Press **I**
+for image presence or **B** for a Box using your own `bin/data/photo.png`; these
+keys explicitly upload that image. It reads
 the key from `bin/data/secrets.json`.
 
 ## Quick start
@@ -89,6 +92,8 @@ cookbook). Different states need separate requests; those run concurrently
 | `noul(name, instructions, whenTrue, whenFalse)` | Same, with descriptions of what yes / no mean (`criteria.true` / `criteria.false`; pass `nullptr` for one side to leave it out). |
 | `choice(name, instructions, options)` | Pick one option. `options` is an object option -> description (`nullptr` for none) or an array of names: `Json::array({"red", "green", "blue"})`. At most 255 options. |
 | `score(name, instructions, levels)` | Rate against ordered levels, lowest first (2 to 10; the API also accepts a single level, but tcxJev warns about it). A `vector<string>` works too. |
+| `box(name, instructions)` | Find one target in an attached image (Jev 1.14); no criteria. |
+| `addImage(pixelsOrImage, options)` | Snapshot CPU pixels and return an `Asset`; requires `Client::imageRequest()`. |
 | `question(name, json)` | Any question object, sent as-is (escape hatch for new API fields). |
 | `model(name)` | Model for this request only. |
 
@@ -107,6 +112,150 @@ jev.request(Request()
 
 There is also a raw form that takes the API's `questions` object directly:
 `jev.request(state, questionsJson)`.
+
+## Images and Box (experimental)
+
+Images are uploaded to TypeSafe's external API. Check their contents for private
+information, faces, screen contents and location clues before sending them.
+Image upload is **opt-in per request**: only images added to that Request are
+sent. `addImage()` snapshots current CPU pixels; submission encodes and uploads
+them. Images and Box are Dreamer-ready and their contract may change.
+
+```cpp
+// photo is an already loaded, upright tc::Image (each side 280..1568).
+auto req = jev.imageRequest();
+auto img = req.addImage(photo);
+req.model("jev-1.14.0").state(Json{{"photo", img}})
+   .noul("visible", "Is there a mug in `photo`?")
+   .box("mug", "The mug nearest the sink in `photo`");
+jev.request(req);
+
+// In the response listener (after checking e.ok):
+if (auto box = e.answers.at("mug").box) {
+    Rect overlay = box->toPixels(photo.getWidth(), photo.getHeight());
+    // box->rect is normalized, top-left origin; confidence is optional.
+}
+```
+
+A Box always contains one rectangle, including when its target is absent.
+Use the companion presence answer to decide whether to use it. Coordinates
+are fractions with x rightward and y downward; `toPixels()` keeps fractional
+pixels. Crop rounding, clipping and mapping crop/padding transforms are the
+caller's responsibility. Missing/null Box confidence stays `std::nullopt`;
+numeric zero remains zero. Malformed Box answers fail the response and retain
+`raw`. Older answer parsing stays permissive.
+
+The existing default remains `jev-latest`. Pin image/Box requests to
+`jev-1.14.0`; the currently documented `jev-latest` alias points to 1.13 and
+cannot answer Box. Known 1.13 IDs and that alias fail locally for Box.
+
+`Asset` is an opaque copyable identity, serializable through ADL in `Json`.
+Use `asset.ref()` for inline references, for example
+`"Compare this picture: " + asset.ref()`. State, instructions and criteria
+support nested references, including Choice descriptions, Noul true/false
+criteria and Score levels. Every reference must belong to that Request and
+every attached image must be used. Object keys do not count. Image requests
+reject malformed/unknown `tcxjev-asset-` tokens; plain text requests keep their
+existing bytes and do not scan this prefix. References are a string convention,
+not a provenance check. Request copies share immutable pixels and binding;
+another Client cannot submit them. Asset handles alone retain no pixels.
+`toJson()` returns logical JSON with an `assets` multipart manifest, not a
+self-contained image upload.
+
+`ImageOptions` defaults: Auto encoding, JPEG quality 90, `maxSide = 0`, straight
+alpha, sRGB, top-left row order and an opaque white JPEG matte. Auto selects **JPEG when
+all pixels are opaque, PNG if any pixel is nonopaque**, including gray-alpha.
+U8 gray, gray-alpha, RGB and RGBA are supported. Empty/F32 images are rejected.
+Force `ImageEncoding::PNG` for diagrams, or `JPEG` for an explicit matte;
+quality must be 1..100. Explicit JPEG composites transparency in linear light.
+Set `alpha`, `colorSpace` and `origin` to the actual source contract;
+premultiplied RGB is unpremultiplied before transfer conversion. The private
+encoder is unaffected by core's global write-flip flag. Resizing happens only
+when `maxSide` is positive. No EXIF rotation, tone mapping, codec fallback or
+quality reduction occurs.
+Prevent source mutation during `addImage()`. `Image::getPixels()` supplies the
+CPU snapshot; texture changes alone are not read back. For an Fbo, explicitly
+read pixels on the main thread after `end()` and outside active Fbo passes,
+and verify that backend's row/color/alpha contract. There is no Fbo overload.
+
+### Reducing cost
+
+Set `ImageOptions::maxSide` to explicitly downscale before encoding; its default
+**0** preserves the original dimensions. A positive value bounds the longer
+side and never upscales. The shorter side is rounded to the nearest pixel,
+with exact halves rounded up: 1920×1080 with `maxSide = 1568` becomes
+**1568×882**. Negative values fail locally. Area averaging uses the source
+color space and weights straight-alpha colors by coverage. Auto still chooses
+PNG if any source pixel is nonopaque, even if averaging rounds its alpha to 255.
+
+```cpp
+ImageOptions options;
+options.maxSide = 1568;
+options.jpegQuality = 85; // Upload size only; default 90, valid range 1–100.
+auto req = jev.imageRequest();
+auto img = req.addImage(photo, options);
+jev.request(req.model("jev-1.14.0").state(Json{{"photo", img}})
+    .noul("visible", "Is there a mug in `photo`?"));
+```
+
+Image tokens depend only on resolution (pixel count), so **`maxSide` is the
+cost knob**. `jpegQuality` reduces upload size only, helping transfer time and
+the 32 MiB request-body limit; changing quality or JPEG/PNG format at the same
+resolution does not reduce tokens. Lower resolution can lose detail.
+
+Auditor measurements on 2026-10-22, with one Noul question per image, gave the
+same input-token counts for JPEG q90, JPEG q50 and PNG:
+
+| Resolution | Input tokens |
+| --- | ---: |
+| 1568×1046 | 4541 |
+| 1024×683 | 2135 |
+| 640×427 | 1021 |
+
+These are indicative: roughly **1 token per ~340 pixels plus a small fixed
+part**. At $0.042 per million tokens, a 1568 px image in this example uses about
+4,500 tokens and costs about **$0.0002 (≈0.03 JPY)**. At that resolution, measured
+upload sizes were 325 KB at JPEG q90, 149 KB at q50 and 1.68 MB as PNG. Follow
+[Jev's official image-token guidance](https://docs.typesafe.ai/images#image-tokens)
+once it is published; these measurements are not a billing guarantee.
+
+The addon checks the resulting dimensions against Jev's limits before sending.
+**A short side below 280 px is rejected locally and by the server** (HTTP 400,
+"Invalid image dimensions."), including after resizing. Without `maxSide`, an
+oversized image fails locally without resizing.
+
+`setImageLimits(ImageLimits{snapshotBytes, pendingImageBytes})` tunes per-Client
+budgets: **64 MiB** of retained immutable snapshots and **32 MiB** of raw image
+payload per accepted queued/active job. Copies count storage once for retention;
+repeated submissions count per job for pending admission. Reservations happen
+before allocation/copy/resampling or enqueue and return when ownership ends.
+Opt-in downscaling runs during `addImage()`; **both budgets charge the resized
+raw-channel payload**, and the addon retains no full-size source copy. Without
+downscaling they charge the original snapshot size. A surviving builder keeps
+its snapshots charged after completion. Lower limits do not revoke existing
+work; zero blocks new payload. Snapshot exhaustion returns a false Asset with
+an empty `ref()` and makes the Request fail locally when submitted. Pending
+exhaustion returns 0, logs byte counts, and emits no event. Client destruction
+closes image registration even on surviving builders. These budgets exclude
+JSON, allocator overhead and encoder/body scratch space.
+
+Local preflight enforces the [image limits](https://docs.typesafe.ai/images):
+each side 280..1568 and area 78,400..2,458,624 after optional downscaling,
+16 MiB per encoded file, and 32 MiB for the complete multipart body including
+framing. References are at
+most 1,024 UTF-8 bytes each and 65,536 combined. Opt-in JSON requires valid
+UTF-8, finite numbers and at most 64 object/array levels in each content field.
+Distinct encoded images and reference-expanded encoded content each fit 32 MiB.
+An additional **addon guard** checks decoded RGBA distinct/expanded bytes plus
+serialized text/structure against 32 MiB. Every repeated reference counts.
+Upstream re-encoding sizes and image context tokens cannot be predicted
+exactly: these guards do not guarantee the server's processed-size/context
+limits. No token estimate or automatic long-context mode is provided.
+
+After acceptance, local preparation failures fire once with `ok=false`,
+`cancelled=false`, status 0 and null `raw`, without transport or retries.
+Actual image requests use multipart and the per-request
+`TypeSafe-Danger-Zone-Images: true` header. Assetless Box requests fail locally.
 
 ## Reading the response
 
@@ -129,7 +278,8 @@ answered, failed or cancelled. `ResponseEventArgs`:
 
 | Field | Question type | Meaning |
 |-------|---------------|---------|
-| `type` | all | `QuestionType::Noul` / `Choice` / `Score` (`Unknown` for anything else). |
+| `type` | all | `QuestionType::Noul` / `Choice` / `Score` / `Box` (`Unknown` for anything else). |
+| `box` | Box | Optional `BoxResult { rect, confidence }`; normalized top-left Rect and optional numeric confidence. |
 | `noul` | Noul | Probability of yes, 0..1. |
 | `choice` | Choice | The most probable option key. |
 | `score` | Score | Probability-weighted position along the levels (`0` = first level); can land between levels. |
@@ -217,8 +367,8 @@ void tcApp::classifyAll() {    // once, not every frame
   not been sent yet and `cancelAll()` empties the queue; each dropped request
   still fires once, right away on the calling thread, with `cancelled` set.
   Requests already being sent can't be cancelled (they are billed anyway).
-- The API allows 1200 requests per minute per key (see
-  [Errors and retries](#errors-and-retries) for what happens beyond that).
+- API rate limits are per organization; see
+  [Errors and retries](#errors-and-retries) for client pause behavior.
 
 ## API key
 
@@ -246,13 +396,15 @@ void tcApp::classifyAll() {    // once, not every frame
 
 | Status | Meaning | Retried |
 |--------|---------|---------|
-| 400 | The request was rejected: an invalid question or model (e.g. a Choice with no options, more than 10 Score levels, an unknown model); `error` carries the reason | no |
+| 400 | Image/asset/multipart/header errors, `max_tokens_exceeded`, or the request was rejected: an invalid question or model (e.g. a Choice with no options, more than 10 Score levels, an unknown model); `error` carries the reason | no |
 | 401 | Missing or invalid API key | no |
+| 413 | Image/body/expanded content too large | no |
+| 415 | Unsupported image encoding | no |
 | 422 | The request body failed schema validation (e.g. a missing field such as `state`) | no |
 | 429 | Rate limited | yes, pauses the whole client |
 | 529 | Overloaded | yes, pauses the whole client |
 | 408, other 5xx | Timeout / server error | yes |
-| 0 | No HTTP response (connection failure, timeout) | yes |
+| 0 | Network error/timeout; or local image validation failure | network only |
 
 - Retries: `setMaxRetries(n)` (default 3 retries after the first attempt, 0
   disables every retry), with exponential backoff `setRetryDelay(initial, max)`
@@ -280,9 +432,9 @@ proxy (so the app doesn't hold the key) or to fake the server in tests:
 ```cpp
 jev.setTransport([](const TransportRequest& req) {
     TransportResponse res;
-    // POST req.body (JSON) to req.url with "Authorization: Bearer " + req.apiKey,
-    // timeout req.timeoutSeconds; fill statusCode + body (or error when there
-    // is no response).
+    // POST req.body.data(), req.body.size() (binary-safe) to req.url.
+    // Forward req.contentType and every req.headers entry; use apiKey only
+    // for Authorization: Bearer. Apply req.timeoutSeconds and fill the result.
     return res;
 });
 ```
@@ -290,7 +442,9 @@ jev.setTransport([](const TransportRequest& req) {
 It runs on a worker thread (async) or the calling thread (sync), up to
 `getMaxConcurrent()` calls at a time per client, so it must be thread-safe
 (or call `setMaxConcurrent(1)`). With a custom transport `request()` doesn't
-require an API key. An empty function restores the default tcxCurl transport.
+require an API key. An empty function restores the default tcxCurl transport. Custom transports
+must forward the appended `contentType` and `headers` fields to support images;
+existing JSON transports remain source compatible.
 
 ## Platforms
 
