@@ -1,0 +1,12 @@
+# Local checkout build, matching ../tests and avoiding shared build directories.
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT EXISTS "${TRUSSC_ROOT}/core/CMakeLists.txt")
+    message(FATAL_ERROR "Set -DTRUSSC_ROOT=/path/to/TrussC")
+endif()
+add_subdirectory("${TRUSSC_ROOT}/core" trussc)
+add_subdirectory("${TRUSSC_ROOT}/addons/tcxCurl" tcxCurl)
+add_subdirectory(.. tcxJev)
+add_executable(${PROJECT_NAME} src/main.cpp)
+target_link_libraries(${PROJECT_NAME} PRIVATE tcxJev tcxCurl)
+include("${CMAKE_CURRENT_SOURCE_DIR}/local.cmake")
